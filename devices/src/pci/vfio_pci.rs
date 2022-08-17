@@ -7,6 +7,8 @@ use std::cmp::min;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+#[cfg(feature = "direct")]
+use std::collections::HashMap;
 use std::fs;
 #[cfg(feature = "direct")]
 use std::path::Path;
@@ -1574,11 +1576,7 @@ impl PciDevice for VfioPciDevice {
         rds
     }
 
-    fn assign_irq(
-        &mut self,
-        irq_evt: &IrqLevelEvent,
-        _irq_num: Option<u32>,
-    ) -> Option<(u32, PciInterruptPin)> {
+    fn preferred_irq(&self) -> Option<(PciInterruptPin, u32)> {
         // Is INTx configured?
         let pin = match self.config.read_config::<u8>(PCI_INTERRUPT_PIN) {
             1 => Some(PciInterruptPin::IntA),
@@ -1587,12 +1585,6 @@ impl PciDevice for VfioPciDevice {
             4 => Some(PciInterruptPin::IntD),
             _ => None,
         }?;
-
-        // Keep event/resample event references.
-        self.interrupt_evt = Some(irq_evt.try_clone().ok()?);
-
-        // enable INTX
-        self.enable_intx();
 
         // TODO: replace sysfs/irq value parsing with vfio interface
         //       reporting host allocated interrupt number and type.
@@ -1603,9 +1595,19 @@ impl PciDevice for VfioPciDevice {
             .map(|v| v.trim().parse::<u32>().unwrap_or(0))
             .unwrap_or(0);
 
-        self.config.write_config(gsi as u8, PCI_INTERRUPT_NUM);
+        Some((pin, gsi))
+    }
 
-        Some((gsi, pin))
+    fn assign_irq(&mut self, irq_evt: IrqLevelEvent, pin: PciInterruptPin, irq_num: u32) {
+        // Keep event/resample event references.
+        self.interrupt_evt = Some(irq_evt);
+
+        // enable INTX
+        self.enable_intx();
+
+        self.config
+            .write_config(pin.to_mask() as u8, PCI_INTERRUPT_PIN);
+        self.config.write_config(irq_num as u8, PCI_INTERRUPT_NUM);
     }
 
     fn allocate_io_bars(
@@ -1975,6 +1977,8 @@ impl Drop for VfioPciDevice {
 
 #[cfg(test)]
 mod tests {
+    use resources::AddressRange;
+
     use super::VfioResourceAllocator;
 
     #[test]
