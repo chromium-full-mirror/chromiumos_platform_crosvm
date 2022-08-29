@@ -223,13 +223,7 @@ fn run_worker(
         for event in events.iter().filter(|e| e.is_readable) {
             match event.token {
                 Token::AcpiEvent => {
-                    acpi_event_run(
-                        &acpi_event_sock,
-                        &gpe0,
-                        &pm1,
-                        &sci_evt,
-                        &acpi_event_ignored_gpe,
-                    );
+                    acpi_event_run(&acpi_event_sock, &gpe0, &sci_evt, &acpi_event_ignored_gpe);
                 }
                 Token::InterruptResample => {
                     sci_evt.clear_resample();
@@ -291,22 +285,6 @@ fn acpi_event_handle_gpe(
     }
 }
 
-const ACPI_BUTTON_NOTIFY_STATUS: u32 = 0x80;
-
-fn acpi_event_handle_power_button(
-    acpi_event: AcpiNotifyEvent,
-    pm1: &Arc<Mutex<Pm1Resource>>,
-    sci_evt: &IrqLevelEvent,
-) {
-    // If received power button event, emulate PM/PWRBTN_STS and trigger SCI
-    if acpi_event._type == ACPI_BUTTON_NOTIFY_STATUS && acpi_event.bus_id.contains("LNXPWRBN") {
-        let mut pm1 = pm1.lock();
-
-        pm1.status |= BITMASK_PM1STS_PWRBTN_STS;
-        pm1.trigger_sci(sci_evt);
-    }
-}
-
 fn get_acpi_event_group() -> Option<u32> {
     // Create netlink generic socket which will be used to query about given family name
     let netlink_ctrl_sock = match NetlinkGenericSocket::new(0) {
@@ -326,7 +304,6 @@ fn get_acpi_event_group() -> Option<u32> {
 fn acpi_event_run(
     acpi_event_sock: &NetlinkGenericSocket,
     gpe0: &Arc<Mutex<GpeResource>>,
-    pm1: &Arc<Mutex<Pm1Resource>>,
     sci_evt: &IrqLevelEvent,
     ignored_gpe: &[u32],
 ) {
@@ -356,7 +333,6 @@ fn acpi_event_run(
                     ignored_gpe,
                 );
             }
-            "button/power" => acpi_event_handle_power_button(acpi_event, pm1, sci_evt),
             c => warn!("unknown acpi event {}", c),
         };
     }
