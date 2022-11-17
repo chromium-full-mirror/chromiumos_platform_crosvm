@@ -328,10 +328,9 @@ fn configure_system(
     )?;
 
     let zero_page_addr = GuestAddress(ZERO_PAGE_OFFSET);
-    if !guest_mem.is_valid_range(zero_page_addr, mem::size_of::<boot_params>() as u64) {
-        return Err(Error::ZeroPagePastRamEnd);
-    }
-
+    guest_mem
+        .checked_offset(zero_page_addr, mem::size_of::<boot_params>() as u64)
+        .ok_or(Error::ZeroPagePastRamEnd)?;
     guest_mem
         .write_obj_at_addr(params, zero_page_addr)
         .map_err(|_| Error::ZeroPageSetup)?;

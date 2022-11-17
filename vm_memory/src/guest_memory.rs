@@ -315,10 +315,7 @@ impl GuestMemory {
             .any(|region| region.start() < end && start < region.end())
     }
 
-    /// Returns an address `addr + offset` if it's in range.
-    ///
-    /// This function doesn't care whether a region `[addr, addr + offset)` is in range or not. To
-    /// guarantee it's a valid range, use `is_valid_range()` instead.
+    /// Returns the address plus the offset if it is in range.
     pub fn checked_offset(&self, addr: GuestAddress, offset: u64) -> Option<GuestAddress> {
         addr.checked_add(offset).and_then(|a| {
             if self.address_in_range(a) {
@@ -327,24 +324,6 @@ impl GuestMemory {
                 None
             }
         })
-    }
-
-    /// Returns true if the given range `[start, start + length)` is a valid contiguous memory
-    /// range available to the guest and it's backed by a single underlying memory region.
-    pub fn is_valid_range(&self, start: GuestAddress, length: u64) -> bool {
-        if length == 0 {
-            return false;
-        }
-
-        let end = if let Some(end) = start.checked_add(length - 1) {
-            end
-        } else {
-            return false;
-        };
-
-        self.regions
-            .iter()
-            .any(|region| region.start() <= start && end < region.end())
     }
 
     /// Returns the size of the memory region in bytes.
@@ -885,15 +864,8 @@ mod tests {
     #[test]
     fn two_regions() {
         let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x10000);
-        // The memory regions are `[0x0, 0x10000)`, `[0x10000, 0x20000)`.
-        let gm = GuestMemory::new(&[(start_addr1, 0x10000), (start_addr2, 0x10000)]).unwrap();
-
-        // Although each address in `[0x0, 0x20000)` is valid, `is_valid_range()` returns false for
-        // a range that is across multiple underlying regions.
-        assert!(gm.is_valid_range(GuestAddress(0x5000), 0x5000));
-        assert!(gm.is_valid_range(GuestAddress(0x10000), 0x5000));
-        assert!(!gm.is_valid_range(GuestAddress(0x5000), 0x10000));
+        let start_addr2 = GuestAddress(0x4000);
+        assert!(GuestMemory::new(&[(start_addr1, 0x4000), (start_addr2, 0x4000)]).is_ok());
     }
 
     #[test]
@@ -906,36 +878,19 @@ mod tests {
     #[test]
     fn region_hole() {
         let start_addr1 = GuestAddress(0x0);
-        let start_addr2 = GuestAddress(0x40000);
-        // The memory regions are `[0x0, 0x20000)`, `[0x40000, 0x60000)`.
-        let gm = GuestMemory::new(&[(start_addr1, 0x20000), (start_addr2, 0x20000)]).unwrap();
-
-        assert!(gm.address_in_range(GuestAddress(0x10000)));
-        assert!(!gm.address_in_range(GuestAddress(0x30000)));
-        assert!(gm.address_in_range(GuestAddress(0x50000)));
-        assert!(!gm.address_in_range(GuestAddress(0x60000)));
-        assert!(!gm.address_in_range(GuestAddress(0x60000)));
-        assert!(gm.range_overlap(GuestAddress(0x10000), GuestAddress(0x30000)),);
-        assert!(!gm.range_overlap(GuestAddress(0x30000), GuestAddress(0x40000)),);
-        assert!(gm.range_overlap(GuestAddress(0x30000), GuestAddress(0x70000)),);
-        assert_eq!(gm.checked_offset(GuestAddress(0x10000), 0x10000), None);
-        assert_eq!(
-            gm.checked_offset(GuestAddress(0x50000), 0x8000),
-            Some(GuestAddress(0x58000))
-        );
-        assert_eq!(gm.checked_offset(GuestAddress(0x50000), 0x10000), None);
-        assert!(gm.is_valid_range(GuestAddress(0x0), 0x10000));
-        assert!(gm.is_valid_range(GuestAddress(0x0), 0x20000));
-        assert!(!gm.is_valid_range(GuestAddress(0x0), 0x20000 + 1));
-
-        // While `checked_offset(GuestAddress(0x10000), 0x40000)` succeeds because 0x50000 is a
-        // valid address, `is_valid_range(GuestAddress(0x10000), 0x40000)` returns `false`
-        // because there is a hole inside of [0x10000, 0x50000).
-        assert_eq!(
-            gm.checked_offset(GuestAddress(0x10000), 0x40000),
-            Some(GuestAddress(0x50000))
-        );
-        assert!(!gm.is_valid_range(GuestAddress(0x10000), 0x40000));
+        let start_addr2 = GuestAddress(0x4000);
+        let gm = GuestMemory::new(&[(start_addr1, 0x2000), (start_addr2, 0x2000)]).unwrap();
+        assert!(gm.address_in_range(GuestAddress(0x1000)));
+        assert!(!gm.address_in_range(GuestAddress(0x3000)));
+        assert!(gm.address_in_range(GuestAddress(0x5000)));
+        assert!(!gm.address_in_range(GuestAddress(0x6000)));
+        assert!(!gm.address_in_range(GuestAddress(0x6000)));
+        assert!(gm.range_overlap(GuestAddress(0x1000), GuestAddress(0x3000)));
+        assert!(!gm.range_overlap(GuestAddress(0x3000), GuestAddress(0x4000)));
+        assert!(gm.range_overlap(GuestAddress(0x3000), GuestAddress(0x7000)));
+        assert!(gm.checked_offset(GuestAddress(0x1000), 0x1000).is_none());
+        assert!(gm.checked_offset(GuestAddress(0x5000), 0x800).is_some());
+        assert!(gm.checked_offset(GuestAddress(0x5000), 0x1000).is_none());
     }
 
     #[test]
