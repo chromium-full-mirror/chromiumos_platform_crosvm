@@ -119,8 +119,9 @@ where
         )
         .expect("failed to register memory");
 
+    let run_handle = vcpu.take_run_handle(None).unwrap();
     loop {
-        match vcpu.run().expect("run failed") {
+        match vcpu.run(&run_handle).expect("run failed") {
             // Continue on external interrupt or signal
             VcpuExit::Intr => continue,
             VcpuExit::Hlt => break,

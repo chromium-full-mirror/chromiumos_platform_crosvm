@@ -110,8 +110,9 @@ where
     // Ensure we get exactly 2 exits for the mmio and the pio.
     let exits = AtomicU16::new(0);
 
+    let run_handle = vcpu.take_run_handle(None).unwrap();
     loop {
-        match vcpu.run().expect("run failed") {
+        match vcpu.run(&run_handle).expect("run failed") {
             VcpuExit::Mmio => {
                 vcpu.handle_mmio(&mut |IoParams {
                                            address,

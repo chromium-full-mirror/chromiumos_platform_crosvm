@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::cell::RefCell;
 use std::fs::File;
 use std::io::prelude::*;
 use std::sync::mpsc;
@@ -24,15 +23,15 @@ use arch::LinuxArch;
 use arch::VcpuArch;
 use arch::VcpuInitArch;
 use arch::VmArch;
-use base::signal::BlockedSignal;
 use base::*;
 use devices::Bus;
 use devices::IrqChip;
 use devices::VcpuRunState;
 use hypervisor::IoOperation;
 use hypervisor::IoParams;
+use hypervisor::Vcpu;
 use hypervisor::VcpuExit;
-use hypervisor::VcpuSignalHandle;
+use hypervisor::VcpuRunHandle;
 use libc::c_int;
 #[cfg(target_arch = "riscv64")]
 use riscv64::Riscv64 as Arch;
@@ -49,6 +48,17 @@ use x86_64::X8664arch as Arch;
 use super::ExitState;
 #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
 use crate::crosvm::ratelimit::Ratelimit;
+
+pub fn setup_vcpu_signal_handler<T: Vcpu>() -> Result<()> {
+    unsafe {
+        extern "C" fn handle_signal<T: Vcpu>(_: c_int) {
+            T::set_local_immediate_exit(true);
+        }
+        register_rt_signal_handler(SIGRTMIN() + 0, handle_signal::<T>)
+            .context("error registering signal handler")?;
+    }
+    Ok(())
+}
 
 fn bus_io_handler(bus: &Bus) -> impl FnMut(IoParams) -> Option<[u8; 8]> + '_ {
     |IoParams {
@@ -129,7 +139,7 @@ pub fn runnable_vcpu<V>(
     vcpu_count: usize,
     has_bios: bool,
     cpu_config: Option<CpuConfigArch>,
-) -> Result<V>
+) -> Result<(V, VcpuRunHandle)>
 where
     V: VcpuArch,
 {
@@ -166,51 +176,18 @@ where
     )
     .context("failed to configure vcpu")?;
 
-    Ok(vcpu)
-}
+    let vcpu_run_handle = vcpu
+        .take_run_handle(Some(SIGRTMIN() + 0))
+        .context("failed to set thread id for vcpu")?;
 
-thread_local!(static VCPU_THREAD: RefCell<Option<VcpuSignalHandle>> = RefCell::new(None));
-
-fn set_vcpu_thread_local(vcpu: Option<&dyn VcpuArch>, signal_num: c_int) {
-    // Block signal while we add -- if a signal fires (very unlikely,
-    // as this means something is trying to pause the vcpu before it has
-    // even started) it'll try to grab the read lock while this write
-    // lock is grabbed and cause a deadlock.
-    // Assuming that a failure to block means it's already blocked.
-    let _blocked_signal = BlockedSignal::new(signal_num);
-
-    VCPU_THREAD.with(|v| {
-        let mut vcpu_thread = v.borrow_mut();
-
-        if let Some(vcpu) = vcpu {
-            assert!(vcpu_thread.is_none());
-            *vcpu_thread = Some(vcpu.signal_handle());
-        } else {
-            *vcpu_thread = None;
-        }
-    });
-}
-
-pub fn setup_vcpu_signal_handler() -> Result<()> {
-    unsafe {
-        extern "C" fn handle_signal(_: c_int) {
-            VCPU_THREAD.with(|v| {
-                if let Some(vcpu_signal_handle) = &(*v.borrow()) {
-                    vcpu_signal_handle.signal_immediate_exit();
-                }
-            });
-        }
-
-        register_rt_signal_handler(SIGRTMIN() + 0, handle_signal)
-            .context("error registering signal handler")?;
-    }
-    Ok(())
+    Ok((vcpu, vcpu_run_handle))
 }
 
 fn vcpu_loop<V>(
     mut run_mode: VmRunMode,
     cpu_id: usize,
     mut vcpu: V,
+    vcpu_run_handle: VcpuRunHandle,
     irq_chip: Box<dyn IrqChipArch + 'static>,
     run_rt: bool,
     delay_rt: bool,
@@ -225,7 +202,7 @@ fn vcpu_loop<V>(
     bus_lock_ratelimit_ctrl: Arc<Mutex<Ratelimit>>,
 ) -> ExitState
 where
-    V: VcpuArch,
+    V: VcpuArch + 'static,
 {
     let mut interrupted_by_signal = false;
 
@@ -348,7 +325,7 @@ where
         // thread kicks this vcpu as a result of some VmControl operation. In most IrqChip
         // implementations HLT instructions do not make it to crosvm, and thus this is a
         // no-op that always returns VcpuRunState::Runnable.
-        match irq_chip.wait_until_runnable(vcpu.as_vcpu()) {
+        match irq_chip.wait_until_runnable(&vcpu) {
             Ok(VcpuRunState::Runnable) => {}
             Ok(VcpuRunState::Interrupted) => interrupted_by_signal = true,
             Err(e) => error!(
@@ -358,7 +335,7 @@ where
         }
 
         if !interrupted_by_signal {
-            match vcpu.run() {
+            match vcpu.run(&vcpu_run_handle) {
                 Ok(VcpuExit::Io) => {
                     if let Err(e) = vcpu.handle_io(&mut bus_io_handler(&io_bus)) {
                         error!("failed to handle io: {}", e)
@@ -463,7 +440,7 @@ where
             vcpu.set_immediate_exit(false);
         }
 
-        if let Err(e) = irq_chip.inject_interrupts(vcpu.as_vcpu()) {
+        if let Err(e) = irq_chip.inject_interrupts(&vcpu) {
             error!("failed to inject interrupts for vcpu {}: {}", cpu_id, e);
         }
     }
@@ -548,7 +525,7 @@ where
 
                 start_barrier.wait();
 
-                let vcpu = match runnable_vcpu {
+                let (vcpu, vcpu_run_handle) = match runnable_vcpu {
                     Ok(v) => v,
                     Err(e) => {
                         error!("failed to start vcpu {}: {:#}", cpu_id, e);
@@ -556,15 +533,14 @@ where
                     }
                 };
 
-                set_vcpu_thread_local(Some(&vcpu), SIGRTMIN() + 0);
-
                 mmio_bus.set_access_id(cpu_id);
                 io_bus.set_access_id(cpu_id);
 
-                let vcpu_exit_state = vcpu_loop(
+                vcpu_loop(
                     run_mode,
                     cpu_id,
                     vcpu,
+                    vcpu_run_handle,
                     irq_chip,
                     run_rt,
                     delay_rt,
@@ -580,11 +556,7 @@ where
                     msr_handlers,
                     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), unix))]
                     bus_lock_ratelimit_ctrl,
-                );
-
-                set_vcpu_thread_local(None, SIGRTMIN() + 0);
-
-                vcpu_exit_state
+                )
             };
 
             let final_event_data = match vcpu_fn() {
