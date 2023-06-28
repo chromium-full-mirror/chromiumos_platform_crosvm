@@ -10,15 +10,18 @@ use gunyah_sys::*;
 
 use std::collections::HashSet;
 
+use std::cell::RefCell;
 use std::cmp::min;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::ffi::CString;
+use std::mem::ManuallyDrop;
 use std::os::raw::c_ulong;
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use std::mem::size_of;
@@ -31,6 +34,7 @@ use base::ioctl;
 use base::ioctl_with_ref;
 use base::ioctl_with_val;
 use base::pagesize;
+use base::sys::BlockedSignal;
 use base::warn;
 use base::Error;
 use base::FromRawDescriptor;
@@ -40,6 +44,7 @@ use base::MemoryMappingBuilderUnix;
 use base::MmapError;
 use base::RawDescriptor;
 use libc::open;
+use libc::EBUSY;
 use libc::EFAULT;
 use libc::EINVAL;
 use libc::EIO;
@@ -303,7 +308,8 @@ impl GunyahVm {
             vm: self.vm.try_clone()?,
             vcpu,
             id,
-            run_mmap: Arc::new(run_mmap),
+            run_mmap,
+            vcpu_run_handle_fingerprint: Default::default(),
         })
     }
 
@@ -627,23 +633,16 @@ pub struct GunyahVcpu {
     vm: SafeDescriptor,
     vcpu: SafeDescriptor,
     id: usize,
-    run_mmap: Arc<MemoryMapping>,
+    run_mmap: MemoryMapping,
+    vcpu_run_handle_fingerprint: Arc<AtomicU64>,
 }
 
-struct GunyahVcpuSignalHandle {
-    run_mmap: Arc<MemoryMapping>,
+pub(super) struct VcpuThread {
+    run: *mut gh_vcpu_run,
+    signal_num: Option<c_int>,
 }
 
-impl VcpuSignalHandleInner for GunyahVcpuSignalHandle {
-    fn signal_immediate_exit(&self) {
-        // SAFETY: we ensure `run_mmap` is a valid mapping of `kvm_run` at creation time, and the
-        // `Arc` ensures the mapping still exists while we hold a reference to it.
-        unsafe {
-            let run = self.run_mmap.as_ptr() as *mut gh_vcpu_run;
-            (*run).immediate_exit = 1;
-        }
-    }
-}
+thread_local!(static VCPU_THREAD: RefCell<Option<VcpuThread>> = RefCell::new(None));
 
 impl AsRawDescriptor for GunyahVcpu {
     fn as_raw_descriptor(&self) -> RawDescriptor {
@@ -657,12 +656,17 @@ impl Vcpu for GunyahVcpu {
         Self: Sized,
     {
         let vcpu = self.vcpu.try_clone()?;
+        let run_mmap = MemoryMappingBuilder::new(self.run_mmap.size())
+            .from_descriptor(&vcpu)
+            .build()
+            .map_err(|_| Error::new(ENOSPC))?;
 
         Ok(GunyahVcpu {
             vm: self.vm.try_clone()?,
             vcpu,
             id: self.id,
-            run_mmap: self.run_mmap.clone(),
+            run_mmap,
+            vcpu_run_handle_fingerprint: self.vcpu_run_handle_fingerprint.clone(),
         })
     }
 
@@ -670,7 +674,71 @@ impl Vcpu for GunyahVcpu {
         self
     }
 
-    fn run(&mut self) -> Result<VcpuExit> {
+    #[allow(clippy::cast_ptr_alignment)]
+    fn take_run_handle(&self, signal_num: Option<c_int>) -> Result<VcpuRunHandle> {
+        fn vcpu_run_handle_drop() {
+            VCPU_THREAD.with(|v| {
+                // This assumes that a failure in `BlockedSignal::new` means the signal is already
+                // blocked and there it should not be unblocked on exit.
+                let _blocked_signal = &(*v.borrow())
+                    .as_ref()
+                    .and_then(|state| state.signal_num)
+                    .map(BlockedSignal::new);
+
+                *v.borrow_mut() = None;
+            });
+        }
+
+        // Prevent `vcpu_run_handle_drop` from being called until we actually setup the signal
+        // blocking. The handle needs to be made now so that we can use the fingerprint.
+        let vcpu_run_handle = ManuallyDrop::new(VcpuRunHandle::new(vcpu_run_handle_drop));
+
+        // AcqRel ordering is sufficient to ensure only one thread gets to set its fingerprint to
+        // this Vcpu and subsequent `run` calls will see the fingerprint.
+        if self
+            .vcpu_run_handle_fingerprint
+            .compare_exchange(
+                0,
+                vcpu_run_handle.fingerprint().as_u64(),
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(Error::new(EBUSY));
+        }
+
+        // Block signal while we add -- if a signal fires (very unlikely,
+        // as this means something is trying to pause the vcpu before it has
+        // even started) it'll try to grab the read lock while this write
+        // lock is grabbed and cause a deadlock.
+        // Assuming that a failure to block means it's already blocked.
+        let _blocked_signal = signal_num.map(BlockedSignal::new);
+
+        VCPU_THREAD.with(|v| {
+            if v.borrow().is_none() {
+                *v.borrow_mut() = Some(VcpuThread {
+                    run: self.run_mmap.as_ptr() as *mut gh_vcpu_run,
+                    signal_num,
+                });
+                Ok(())
+            } else {
+                Err(Error::new(EBUSY))
+            }
+        })?;
+
+        Ok(ManuallyDrop::into_inner(vcpu_run_handle))
+    }
+
+    fn run(&mut self, run_handle: &VcpuRunHandle) -> Result<VcpuExit> {
+        if self
+            .vcpu_run_handle_fingerprint
+            .load(std::sync::atomic::Ordering::Acquire)
+            != run_handle.fingerprint().as_u64()
+        {
+            panic!("invalid VcpuRunHandle used to run Vcpu");
+        }
+
         // Safe because we know our file is a VCPU fd and we verify the return result.
         let ret = unsafe { ioctl(self, GH_VCPU_RUN()) };
         if ret != 0 {
@@ -731,12 +799,24 @@ impl Vcpu for GunyahVcpu {
         run.immediate_exit = exit.into();
     }
 
-    fn signal_handle(&self) -> VcpuSignalHandle {
-        VcpuSignalHandle {
-            inner: Box::new(GunyahVcpuSignalHandle {
-                run_mmap: self.run_mmap.clone(),
-            }),
+    fn set_local_immediate_exit(exit: bool)
+    where
+        Self: Sized,
+    {
+        VCPU_THREAD.with(|v| {
+            if let Some(state) = &(*v.borrow()) {
+                unsafe {
+                    (*state.run).immediate_exit = exit.into();
+                };
+            }
+        });
+    }
+
+    fn set_local_immediate_exit_fn(&self) -> extern "C" fn() {
+        extern "C" fn f() {
+            GunyahVcpu::set_local_immediate_exit(true);
         }
+        f
     }
 
     fn handle_mmio(&self, handle_fn: &mut dyn FnMut(IoParams) -> Option<[u8; 8]>) -> Result<()> {

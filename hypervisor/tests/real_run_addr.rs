@@ -105,8 +105,9 @@ where
     vcpu.set_regs(&vcpu_regs).expect("set regs failed");
 
     let out = Mutex::new(String::new());
+    let run_handle = vcpu.take_run_handle(None).unwrap();
     loop {
-        match vcpu.run().expect("run failed") {
+        match vcpu.run(&run_handle).expect("run failed") {
             VcpuExit::Io => {
                 vcpu.handle_io(&mut |IoParams {
                                          address,

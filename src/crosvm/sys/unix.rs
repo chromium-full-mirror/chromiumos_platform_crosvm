@@ -2722,7 +2722,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         ));
     }
 
-    vcpu::setup_vcpu_signal_handler()?;
+    vcpu::setup_vcpu_signal_handler::<Vcpu>()?;
 
     let vcpus: Vec<Option<_>> = match linux.vcpus.take() {
         Some(vec) => vec.into_iter().map(Some).collect(),

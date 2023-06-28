@@ -6,6 +6,7 @@
 mod aarch64;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub use aarch64::*;
+use base::sys::BlockedSignal;
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
@@ -13,18 +14,22 @@ mod riscv64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86_64;
 
+use std::cell::RefCell;
 use std::cmp::min;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::ffi::CString;
+use std::mem::ManuallyDrop;
+use std::os::raw::c_int;
 use std::os::raw::c_ulong;
 use std::os::raw::c_void;
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::copy_nonoverlapping;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use base::errno_result;
@@ -50,6 +55,7 @@ use base::SafeDescriptor;
 use data_model::vec_with_array_field;
 use kvm_sys::*;
 use libc::open64;
+use libc::EBUSY;
 use libc::EFAULT;
 use libc::EINVAL;
 use libc::EIO;
@@ -85,8 +91,7 @@ use crate::MPState;
 use crate::MemSlot;
 use crate::Vcpu;
 use crate::VcpuExit;
-use crate::VcpuSignalHandle;
-use crate::VcpuSignalHandleInner;
+use crate::VcpuRunHandle;
 use crate::Vm;
 use crate::VmCap;
 
@@ -300,7 +305,8 @@ impl KvmVm {
             vm: self.vm.try_clone()?,
             vcpu,
             id,
-            run_mmap: Arc::new(run_mmap),
+            run_mmap,
+            vcpu_run_handle_fingerprint: Default::default(),
         })
     }
 
@@ -774,46 +780,101 @@ impl AsRawDescriptor for KvmVm {
     }
 }
 
-struct KvmVcpuSignalHandle {
-    run_mmap: Arc<MemoryMapping>,
-}
-
-impl VcpuSignalHandleInner for KvmVcpuSignalHandle {
-    fn signal_immediate_exit(&self) {
-        // SAFETY: we ensure `run_mmap` is a valid mapping of `kvm_run` at creation time, and the
-        // `Arc` ensures the mapping still exists while we hold a reference to it.
-        unsafe {
-            let run = self.run_mmap.as_ptr() as *mut kvm_run;
-            (*run).immediate_exit = 1;
-        }
-    }
-}
-
 /// A wrapper around using a KVM Vcpu.
 pub struct KvmVcpu {
     kvm: Kvm,
     vm: SafeDescriptor,
     vcpu: SafeDescriptor,
     id: usize,
-    run_mmap: Arc<MemoryMapping>,
+    run_mmap: MemoryMapping,
+    vcpu_run_handle_fingerprint: Arc<AtomicU64>,
 }
+
+pub(super) struct VcpuThread {
+    run: *mut kvm_run,
+    signal_num: Option<c_int>,
+}
+
+thread_local!(static VCPU_THREAD: RefCell<Option<VcpuThread>> = RefCell::new(None));
 
 impl Vcpu for KvmVcpu {
     fn try_clone(&self) -> Result<Self> {
         let vm = self.vm.try_clone()?;
         let vcpu = self.vcpu.try_clone()?;
+        let run_mmap = MemoryMappingBuilder::new(self.run_mmap.size())
+            .from_descriptor(&vcpu)
+            .build()
+            .map_err(|_| Error::new(ENOSPC))?;
+        let vcpu_run_handle_fingerprint = self.vcpu_run_handle_fingerprint.clone();
 
         Ok(KvmVcpu {
             kvm: self.kvm.try_clone()?,
             vm,
             vcpu,
             id: self.id,
-            run_mmap: self.run_mmap.clone(),
+            run_mmap,
+            vcpu_run_handle_fingerprint,
         })
     }
 
     fn as_vcpu(&self) -> &dyn Vcpu {
         self
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    fn take_run_handle(&self, signal_num: Option<c_int>) -> Result<VcpuRunHandle> {
+        fn vcpu_run_handle_drop() {
+            VCPU_THREAD.with(|v| {
+                // This assumes that a failure in `BlockedSignal::new` means the signal is already
+                // blocked and there it should not be unblocked on exit.
+                let _blocked_signal = &(*v.borrow())
+                    .as_ref()
+                    .and_then(|state| state.signal_num)
+                    .map(BlockedSignal::new);
+
+                *v.borrow_mut() = None;
+            });
+        }
+
+        // Prevent `vcpu_run_handle_drop` from being called until we actually setup the signal
+        // blocking. The handle needs to be made now so that we can use the fingerprint.
+        let vcpu_run_handle = ManuallyDrop::new(VcpuRunHandle::new(vcpu_run_handle_drop));
+
+        // AcqRel ordering is sufficient to ensure only one thread gets to set its fingerprint to
+        // this Vcpu and subsequent `run` calls will see the fingerprint.
+        if self
+            .vcpu_run_handle_fingerprint
+            .compare_exchange(
+                0,
+                vcpu_run_handle.fingerprint().as_u64(),
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(Error::new(EBUSY));
+        }
+
+        // Block signal while we add -- if a signal fires (very unlikely,
+        // as this means something is trying to pause the vcpu before it has
+        // even started) it'll try to grab the read lock while this write
+        // lock is grabbed and cause a deadlock.
+        // Assuming that a failure to block means it's already blocked.
+        let _blocked_signal = signal_num.map(BlockedSignal::new);
+
+        VCPU_THREAD.with(|v| {
+            if v.borrow().is_none() {
+                *v.borrow_mut() = Some(VcpuThread {
+                    run: self.run_mmap.as_ptr() as *mut kvm_run,
+                    signal_num,
+                });
+                Ok(())
+            } else {
+                Err(Error::new(EBUSY))
+            }
+        })?;
+
+        Ok(ManuallyDrop::into_inner(vcpu_run_handle))
     }
 
     fn id(&self) -> usize {
@@ -829,12 +890,21 @@ impl Vcpu for KvmVcpu {
         run.immediate_exit = exit.into();
     }
 
-    fn signal_handle(&self) -> VcpuSignalHandle {
-        VcpuSignalHandle {
-            inner: Box::new(KvmVcpuSignalHandle {
-                run_mmap: self.run_mmap.clone(),
-            }),
+    fn set_local_immediate_exit(exit: bool) {
+        VCPU_THREAD.with(|v| {
+            if let Some(state) = &(*v.borrow()) {
+                unsafe {
+                    (*state.run).immediate_exit = exit.into();
+                };
+            }
+        });
+    }
+
+    fn set_local_immediate_exit_fn(&self) -> extern "C" fn() {
+        extern "C" fn f() {
+            KvmVcpu::set_local_immediate_exit(true);
         }
+        f
     }
 
     fn pvclock_ctrl(&self) -> Result<()> {
@@ -860,7 +930,16 @@ impl Vcpu for KvmVcpu {
     #[allow(clippy::cast_ptr_alignment)]
     // The pointer is page aligned so casting to a different type is well defined, hence the clippy
     // allow attribute.
-    fn run(&mut self) -> Result<VcpuExit> {
+    fn run(&mut self, run_handle: &VcpuRunHandle) -> Result<VcpuExit> {
+        // Acquire is used to ensure this check is ordered after the `compare_exchange` in `run`.
+        if self
+            .vcpu_run_handle_fingerprint
+            .load(std::sync::atomic::Ordering::Acquire)
+            != run_handle.fingerprint().as_u64()
+        {
+            panic!("invalid VcpuRunHandle used to run Vcpu");
+        }
+
         // Safe because we know that our file is a VCPU fd and we verify the return result.
         let ret = unsafe { ioctl(self, KVM_RUN()) };
         if ret != 0 {
