@@ -247,6 +247,7 @@ fn build(
     #[cfg(windows)] wndproc_thread: &mut Option<WindowProcedureThread>,
     udmabuf: bool,
     #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
+    #[cfg(windows)] custom_cursor_path: Option<String>,
 ) -> Option<VirtioGpu> {
     let mut display_opt = None;
     for display_backend in display_backends {
@@ -257,6 +258,8 @@ fn build(
             gpu_display_wait_descriptor_ctrl_wr
                 .try_clone()
                 .expect("failed to clone wait context ctrl channel"),
+            #[cfg(windows)]
+            custom_cursor_path.clone(),
         ) {
             Ok(c) => {
                 display_opt = Some(c);
@@ -1132,6 +1135,7 @@ impl DisplayBackend {
         &self,
         #[cfg(windows)] wndproc_thread: &mut Option<WindowProcedureThread>,
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl: SendTube,
+        #[cfg(windows)] custom_cursor_path: Option<String>,
     ) -> std::result::Result<GpuDisplay, GpuDisplayError> {
         match self {
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1146,6 +1150,7 @@ impl DisplayBackend {
                     /* win_metrics= */ None,
                     gpu_display_wait_descriptor_ctrl,
                     None,
+                    custom_cursor_path,
                 ),
                 None => {
                     error!("wndproc_thread is none");
@@ -1211,6 +1216,9 @@ pub struct Gpu {
     /// sets this to true while stopping the worker.
     sleep_requested: Arc<AtomicBool>,
     worker_snapshot: Option<WorkerSnapshot>,
+    // Path for the bigger more visible custom cursor.
+    #[cfg(windows)]
+    custom_cursor_path: Option<String>,
 }
 
 impl Gpu {
@@ -1317,6 +1325,8 @@ impl Gpu {
             gpu_cgroup_path: gpu_cgroup_path.cloned(),
             sleep_requested: Arc::new(AtomicBool::new(false)),
             worker_snapshot: None,
+            #[cfg(windows)]
+            custom_cursor_path: gpu_parameters.custom_cursor_path.clone(),
         }
     }
 
@@ -1354,6 +1364,8 @@ impl Gpu {
             self.gpu_display_wait_descriptor_ctrl_wr
                 .try_clone()
                 .expect("failed to clone wait context control channel"),
+            #[cfg(windows)]
+            self.custom_cursor_path.take(),
         )?;
 
         for event_device in self.event_devices.take().expect("missing event_devices") {
@@ -1424,6 +1436,9 @@ impl Gpu {
         let (activate_tx, activate_rx) = mpsc::channel();
         let sleep_requested = self.sleep_requested.clone();
 
+        #[cfg(windows)]
+        let custom_cursor_path = self.custom_cursor_path.take();
+
         let worker_thread = WorkerThread::start("v_gpu", move |kill_evt| {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             if let Some(cgroup_path) = gpu_cgroup_path {
@@ -1463,6 +1478,8 @@ impl Gpu {
                 udmabuf,
                 #[cfg(windows)]
                 gpu_display_wait_descriptor_ctrl_wr,
+                #[cfg(windows)]
+                custom_cursor_path,
             ) {
                 Some(backend) => backend,
                 None => {
