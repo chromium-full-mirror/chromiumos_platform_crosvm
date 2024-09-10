@@ -41,10 +41,9 @@ pub mod smbios;
 
 use std::arch::x86_64::CpuidResult;
 use std::collections::BTreeMap;
-use std::ffi::CStr;
-use std::ffi::CString;
 use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -165,6 +164,10 @@ pub enum Error {
     CloneTube(TubeError),
     #[error("the given kernel command line was invalid: {0}")]
     Cmdline(kernel_cmdline::Error),
+    #[error("failed writing command line to guest memory")]
+    CommandLineCopy,
+    #[error("command line overflowed guest memory")]
+    CommandLineOverflow,
     #[error("failed to configure hotplugged pci device: {0}")]
     ConfigurePciDevice(arch::DeviceRegistrationError),
     #[error("failed to configure segment registers: {0}")]
@@ -222,8 +225,6 @@ pub enum Error {
     LoadBios(io::Error),
     #[error("error loading kernel bzImage: {0}")]
     LoadBzImage(bzimage::Error),
-    #[error("error loading command line: {0}")]
-    LoadCmdline(kernel_loader::Error),
     #[error("error loading initrd: {0}")]
     LoadInitrd(arch::LoadImageError),
     #[error("error loading Kernel: {0}")]
@@ -452,7 +453,6 @@ fn tss_addr_end() -> GuestAddress {
 fn configure_system(
     guest_mem: &GuestMemory,
     cmdline_addr: GuestAddress,
-    cmdline_size: usize,
     setup_data: Option<GuestAddress>,
     initrd: Option<(GuestAddress, usize)>,
     mut params: boot_params,
@@ -467,7 +467,6 @@ fn configure_system(
     params.hdr.header = KERNEL_HDR_MAGIC;
     params.hdr.cmd_line_ptr = cmdline_addr.offset() as u32;
     params.ext_cmd_line_ptr = (cmdline_addr.offset() >> 32) as u32;
-    params.hdr.cmdline_size = cmdline_size as u32;
     params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
     if let Some(setup_data) = setup_data {
         params.hdr.setup_data = setup_data.offset();
@@ -1004,12 +1003,7 @@ impl arch::LinuxArch for X8664arch {
         match components.vm_image {
             VmImage::Bios(ref mut bios) => {
                 // Allow a bios to hardcode CMDLINE_OFFSET and read the kernel command line from it.
-                kernel_loader::load_cmdline(
-                    &mem,
-                    GuestAddress(CMDLINE_OFFSET),
-                    &CString::new(cmdline).unwrap(),
-                )
-                .map_err(Error::LoadCmdline)?;
+                Self::load_cmdline(&mem, GuestAddress(CMDLINE_OFFSET), cmdline)?;
                 Self::load_bios(&mem, bios)?;
                 regs::set_default_msrs(&mut msrs);
                 // The default values for `Regs` and `Sregs` already set up the reset vector.
@@ -1020,7 +1014,7 @@ impl arch::LinuxArch for X8664arch {
 
                 Self::setup_system_memory(
                     &mem,
-                    &CString::new(cmdline).unwrap(),
+                    cmdline,
                     components.initrd_image,
                     components.android_fstab,
                     kernel_end,
@@ -1344,6 +1338,32 @@ impl X8664arch {
         Ok(())
     }
 
+    /// Writes the command line string to the given memory slice.
+    ///
+    /// # Arguments
+    ///
+    /// * `guest_mem` - A u8 slice that will be partially overwritten by the command line.
+    /// * `guest_addr` - The address in `guest_mem` at which to load the command line.
+    /// * `cmdline` - The kernel command line.
+    fn load_cmdline(
+        guest_mem: &GuestMemory,
+        guest_addr: GuestAddress,
+        cmdline: kernel_cmdline::Cmdline,
+    ) -> Result<()> {
+        let mut cmdline_guest_mem_slice = guest_mem
+            .get_slice_at_addr(guest_addr, CMDLINE_MAX_SIZE as usize)
+            .map_err(|_| Error::CommandLineOverflow)?;
+
+        let mut cmdline_bytes: Vec<u8> = cmdline.into();
+        cmdline_bytes.push(0u8); // Add NUL terminator.
+
+        cmdline_guest_mem_slice
+            .write_all(&cmdline_bytes)
+            .map_err(|_| Error::CommandLineOverflow)?;
+
+        Ok(())
+    }
+
     /// Loads the kernel from an open file.
     ///
     /// # Arguments
@@ -1392,7 +1412,7 @@ impl X8664arch {
     /// * `initrd_file` - an initial ramdisk image
     pub fn setup_system_memory(
         mem: &GuestMemory,
-        cmdline: &CStr,
+        cmdline: kernel_cmdline::Cmdline,
         initrd_file: Option<File>,
         android_fstab: Option<File>,
         kernel_end: u64,
@@ -1400,8 +1420,7 @@ impl X8664arch {
         dump_device_tree_blob: Option<PathBuf>,
         device_tree_overlays: Vec<DtbOverlay>,
     ) -> Result<()> {
-        kernel_loader::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)
-            .map_err(Error::LoadCmdline)?;
+        Self::load_cmdline(mem, GuestAddress(CMDLINE_OFFSET), cmdline)?;
 
         let mut setup_data = Vec::<SetupData>::new();
         if let Some(android_fstab) = android_fstab {
@@ -1446,7 +1465,6 @@ impl X8664arch {
         configure_system(
             mem,
             GuestAddress(CMDLINE_OFFSET),
-            cmdline.to_bytes().len() + 1,
             setup_data,
             initrd,
             params,
@@ -1489,9 +1507,9 @@ impl X8664arch {
     /// Sets up fw_cfg device.
     ///  # Arguments
     ///
-    /// * - `io_bus` - the IO bus object
-    /// * - `fw_cfg_parameters` - command-line specified data to add to device. May contain
-    /// all None fields if user did not specify data to add to the device
+    /// * `io_bus` - the IO bus object
+    /// * `fw_cfg_parameters` - command-line specified data to add to device. May contain all None
+    ///   fields if user did not specify data to add to the device
     fn setup_fw_cfg_device(
         io_bus: &Bus,
         fw_cfg_parameters: Vec<FwCfgParameters>,
@@ -1634,15 +1652,15 @@ impl X8664arch {
     ///
     /// # Arguments
     ///
-    /// * - `io_bus` the I/O bus to add the devices to
-    /// * - `resources` the SystemAllocator to allocate IO and MMIO for acpi devices.
-    /// * - `suspend_tube` the tube object which used to suspend/resume the VM.
-    /// * - `sdts` ACPI system description tables
-    /// * - `irq_chip` the IrqChip object for registering irq events
-    /// * - `battery` indicate whether to create the battery
-    /// * - `mmio_bus` the MMIO bus to add the devices to
-    /// * - `pci_irqs` IRQ assignment of PCI devices. Tuples of (PCI address, gsi, PCI interrupt
-    ///   pin). Note that this matches one of the return values of generate_pci_root.
+    /// * `io_bus` the I/O bus to add the devices to
+    /// * `resources` the SystemAllocator to allocate IO and MMIO for acpi devices.
+    /// * `suspend_tube` the tube object which used to suspend/resume the VM.
+    /// * `sdts` ACPI system description tables
+    /// * `irq_chip` the IrqChip object for registering irq events
+    /// * `battery` indicate whether to create the battery
+    /// * `mmio_bus` the MMIO bus to add the devices to
+    /// * `pci_irqs` IRQ assignment of PCI devices. Tuples of (PCI address, gsi, PCI interrupt pin).
+    ///   Note that this matches one of the return values of generate_pci_root.
     pub fn setup_acpi_devices(
         pci_root: Arc<Mutex<PciRoot>>,
         mem: &GuestMemory,
@@ -2266,5 +2284,40 @@ mod tests {
             mem.read_obj_from_addr::<[u8; 9]>(entry2_data_addr).unwrap(),
             entry2_data
         );
+    }
+
+    #[test]
+    fn cmdline_overflow() {
+        const MEM_SIZE: u64 = 0x1000;
+        let gm = GuestMemory::new(&[(GuestAddress(0x0), MEM_SIZE)]).unwrap();
+        let mut cmdline = kernel_cmdline::Cmdline::new(CMDLINE_MAX_SIZE as usize);
+        cmdline.insert_str("12345").unwrap();
+        let cmdline_address = GuestAddress(MEM_SIZE - 5);
+        let err = X8664arch::load_cmdline(&gm, cmdline_address, cmdline).unwrap_err();
+        assert!(matches!(err, Error::CommandLineOverflow));
+    }
+
+    #[test]
+    fn cmdline_write_end() {
+        const MEM_SIZE: u64 = 0x1000;
+        let gm = GuestMemory::new(&[(GuestAddress(0x0), MEM_SIZE)]).unwrap();
+        let mut cmdline = kernel_cmdline::Cmdline::new(CMDLINE_MAX_SIZE as usize);
+        cmdline.insert_str("1234").unwrap();
+        let mut cmdline_address = GuestAddress(45);
+        X8664arch::load_cmdline(&gm, cmdline_address, cmdline).unwrap();
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'1');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'2');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'3');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'4');
+        cmdline_address = cmdline_address.unchecked_add(1);
+        let val: u8 = gm.read_obj_from_addr(cmdline_address).unwrap();
+        assert_eq!(val, b'\0');
     }
 }
