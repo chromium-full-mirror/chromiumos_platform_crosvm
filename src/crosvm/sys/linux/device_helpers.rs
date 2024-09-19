@@ -329,12 +329,20 @@ impl<'a> VirtioDeviceBuilder for &'a ScsiConfig<'a> {
     }
 }
 
-fn vhost_user_connection(path: &Path, connect_timeout_ms: Option<u64>) -> Result<UnixStream> {
+fn vhost_user_connection(
+    path: &Path,
+    connect_timeout_ms: Option<u64>,
+) -> Result<vmm_vhost::Connection<vmm_vhost::FrontendReq>> {
     let deadline = connect_timeout_ms.map(|t| Instant::now() + Duration::from_millis(t));
     let mut first = true;
     loop {
         match UnixStream::connect(path) {
-            Ok(x) => return Ok(x),
+            Ok(sock) => {
+                let connection = sock
+                    .try_into()
+                    .context("failed to construct Connection from UnixStream")?;
+                return Ok(connection);
+            }
             Err(e) => {
                 // ConnectionRefused => Might be a stale file the backend hasn't deleted yet.
                 // NotFound => Might be the backend hasn't bound the socket yet.
@@ -376,7 +384,9 @@ fn is_socket(path: &PathBuf) -> bool {
     }
 }
 
-fn vhost_user_connection_from_socket_fd(fd: u32) -> Result<UnixStream> {
+fn vhost_user_connection_from_socket_fd(
+    fd: u32,
+) -> Result<vmm_vhost::Connection<vmm_vhost::FrontendReq>> {
     let path = PathBuf::from(format!("/proc/self/fd/{}", fd));
     if !is_socket(&path) {
         anyhow::bail!("path {} is not socket", path.display());
@@ -384,8 +394,9 @@ fn vhost_user_connection_from_socket_fd(fd: u32) -> Result<UnixStream> {
 
     let safe_fd = safe_descriptor_from_cmdline_fd(&(fd as i32))?;
 
-    let stream: UnixStream = UnixStream::from(safe_fd);
-    Ok(stream)
+    safe_fd
+        .try_into()
+        .context("failed to create vhost-user connection from fd")
 }
 
 pub fn create_vhost_user_frontend(
@@ -1084,8 +1095,9 @@ pub fn create_fs_device(
     fs_cfg: virtio::fs::Config,
     device_tube: Tube,
 ) -> DeviceResult {
-    let max_open_files =
-        base::linux::max_open_files().context("failed to get max number of open files")?;
+    let max_open_files = base::linux::max_open_files()
+        .context("failed to get max number of open files")?
+        .rlim_max;
     let j = if let Some(jail_config) = jail_config {
         let mut config = SandboxConfig::new(jail_config, "fs_device");
         config.limit_caps = false;
@@ -1125,8 +1137,9 @@ pub fn create_9p_device(
     tag: &str,
     mut p9_cfg: p9::Config,
 ) -> DeviceResult {
-    let max_open_files =
-        base::linux::max_open_files().context("failed to get max number of open files")?;
+    let max_open_files = base::linux::max_open_files()
+        .context("failed to get max number of open files")?
+        .rlim_max;
     let (jail, root) = if let Some(jail_config) = jail_config {
         let mut config = SandboxConfig::new(jail_config, "9p_device");
         config.limit_caps = false;
