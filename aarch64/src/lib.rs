@@ -104,7 +104,6 @@ const AARCH64_GIC_CPUI_SIZE: u64 = 0x20000;
 
 // This indicates the start of DRAM inside the physical address space.
 const AARCH64_PHYS_MEM_START: u64 = 0x80000000;
-const AARCH64_AXI_BASE: u64 = 0x40000000;
 const AARCH64_PLATFORM_MMIO_SIZE: u64 = 0x800000;
 
 const AARCH64_PROTECTED_VM_FW_MAX_SIZE: u64 = 0x400000;
@@ -117,7 +116,7 @@ const AARCH64_PVTIME_SIZE: u64 = 64;
 
 // These constants indicate the placement of the GIC registers in the physical
 // address space.
-const AARCH64_GIC_DIST_BASE: u64 = AARCH64_AXI_BASE - AARCH64_GIC_DIST_SIZE;
+const AARCH64_GIC_DIST_BASE: u64 = 0x40000000 - AARCH64_GIC_DIST_SIZE;
 const AARCH64_GIC_CPUI_BASE: u64 = AARCH64_GIC_DIST_BASE - AARCH64_GIC_CPUI_SIZE;
 const AARCH64_GIC_REDIST_SIZE: u64 = 0x20000;
 
@@ -127,6 +126,51 @@ const PSR_F_BIT: u64 = 0x00000040;
 const PSR_I_BIT: u64 = 0x00000080;
 const PSR_A_BIT: u64 = 0x00000100;
 const PSR_D_BIT: u64 = 0x00000200;
+
+// This was the speed kvmtool used, not sure if it matters.
+const AARCH64_SERIAL_SPEED: u32 = 1843200;
+// The serial device gets the first interrupt line
+// Which gets mapped to the first SPI interrupt (physical 32).
+const AARCH64_SERIAL_1_3_IRQ: u32 = 0;
+const AARCH64_SERIAL_2_4_IRQ: u32 = 2;
+
+// Place the RTC device at page 2
+const AARCH64_RTC_ADDR: u64 = 0x2000;
+// The RTC device gets one 4k page
+const AARCH64_RTC_SIZE: u64 = 0x1000;
+// The RTC device gets the second interrupt line
+const AARCH64_RTC_IRQ: u32 = 1;
+
+// The Goldfish battery device gets the 3rd interrupt line
+const AARCH64_BAT_IRQ: u32 = 3;
+
+// Place the virtual watchdog device at page 3
+const AARCH64_VMWDT_ADDR: u64 = 0x3000;
+// The virtual watchdog device gets one 4k page
+const AARCH64_VMWDT_SIZE: u64 = 0x1000;
+
+// PCI MMIO configuration region base address.
+const AARCH64_PCI_CFG_BASE: u64 = 0x10000;
+// PCI MMIO configuration region size.
+const AARCH64_PCI_CFG_SIZE: u64 = 0x1000000;
+// This is the base address of MMIO devices.
+const AARCH64_MMIO_BASE: u64 = 0x2000000;
+// Size of the whole MMIO region.
+const AARCH64_MMIO_SIZE: u64 = 0x2000000;
+// Virtio devices start at SPI interrupt number 4
+const AARCH64_IRQ_BASE: u32 = 4;
+
+// Virtual CPU Frequency Device.
+const AARCH64_VIRTFREQ_BASE: u64 = 0x1040000;
+const AARCH64_VIRTFREQ_SIZE: u64 = 0x8;
+const AARCH64_VIRTFREQ_MAXSIZE: u64 = 0x10000;
+const AARCH64_VIRTFREQ_V2_SIZE: u64 = 0x1000;
+
+// PMU PPI interrupt, same as qemu
+const AARCH64_PMU_IRQ: u32 = 7;
+
+// VCPU stall detector interrupt
+const AARCH64_VMWDT_IRQ: u32 = 15;
 
 enum PayloadType {
     Bios {
@@ -173,51 +217,6 @@ fn get_swiotlb_addr(
         None
     }
 }
-
-// This was the speed kvmtool used, not sure if it matters.
-const AARCH64_SERIAL_SPEED: u32 = 1843200;
-// The serial device gets the first interrupt line
-// Which gets mapped to the first SPI interrupt (physical 32).
-const AARCH64_SERIAL_1_3_IRQ: u32 = 0;
-const AARCH64_SERIAL_2_4_IRQ: u32 = 2;
-
-// Place the RTC device at page 2
-const AARCH64_RTC_ADDR: u64 = 0x2000;
-// The RTC device gets one 4k page
-const AARCH64_RTC_SIZE: u64 = 0x1000;
-// The RTC device gets the second interrupt line
-const AARCH64_RTC_IRQ: u32 = 1;
-
-// The Goldfish battery device gets the 3rd interrupt line
-const AARCH64_BAT_IRQ: u32 = 3;
-
-// Place the virtual watchdog device at page 3
-const AARCH64_VMWDT_ADDR: u64 = 0x3000;
-// The virtual watchdog device gets one 4k page
-const AARCH64_VMWDT_SIZE: u64 = 0x1000;
-
-// PCI MMIO configuration region base address.
-const AARCH64_PCI_CFG_BASE: u64 = 0x10000;
-// PCI MMIO configuration region size.
-const AARCH64_PCI_CFG_SIZE: u64 = 0x1000000;
-// This is the base address of MMIO devices.
-const AARCH64_MMIO_BASE: u64 = 0x2000000;
-// Size of the whole MMIO region.
-const AARCH64_MMIO_SIZE: u64 = 0x2000000;
-// Virtio devices start at SPI interrupt number 4
-const AARCH64_IRQ_BASE: u32 = 4;
-
-// Virtual CPU Frequency Device.
-const AARCH64_VIRTFREQ_BASE: u64 = 0x1040000;
-const AARCH64_VIRTFREQ_SIZE: u64 = 0x8;
-const AARCH64_VIRTFREQ_MAXSIZE: u64 = 0x10000;
-const AARCH64_VIRTFREQ_V2_SIZE: u64 = 0x1000;
-
-// PMU PPI interrupt, same as qemu
-const AARCH64_PMU_IRQ: u32 = 7;
-
-// VCPU stall detector interrupt
-const AARCH64_VMWDT_IRQ: u32 = 15;
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -433,10 +432,32 @@ impl arch::LinuxArch for AArch64 {
         vm: &V,
         _arch_memory_layout: &Self::ArchMemoryLayout,
     ) -> SystemAllocatorConfig {
-        Self::get_resource_allocator_config(
-            vm.get_memory().end_addr(),
-            vm.get_guest_phys_addr_bits(),
-        )
+        let guest_phys_end = 1u64 << vm.get_guest_phys_addr_bits();
+        // The platform MMIO region is immediately past the end of RAM.
+        let plat_mmio_base = vm.get_memory().end_addr().offset();
+        let plat_mmio_size = AARCH64_PLATFORM_MMIO_SIZE;
+        // The high MMIO region is the rest of the address space after the platform MMIO region.
+        let high_mmio_base = plat_mmio_base + plat_mmio_size;
+        let high_mmio_size = guest_phys_end
+            .checked_sub(high_mmio_base)
+            .unwrap_or_else(|| {
+                panic!(
+                    "guest_phys_end {:#x} < high_mmio_base {:#x}",
+                    guest_phys_end, high_mmio_base,
+                );
+            });
+        SystemAllocatorConfig {
+            io: None,
+            low_mmio: AddressRange::from_start_and_size(AARCH64_MMIO_BASE, AARCH64_MMIO_SIZE)
+                .expect("invalid mmio region"),
+            high_mmio: AddressRange::from_start_and_size(high_mmio_base, high_mmio_size)
+                .expect("invalid high mmio region"),
+            platform_mmio: Some(
+                AddressRange::from_start_and_size(plat_mmio_base, plat_mmio_size)
+                    .expect("invalid platform mmio region"),
+            ),
+            first_irq: AARCH64_IRQ_BASE,
+        }
     }
 
     fn build_vm<V, Vcpu>(
@@ -1229,44 +1250,6 @@ impl AArch64 {
         let mut cmdline = kernel_cmdline::Cmdline::new();
         cmdline.insert_str("panic=-1").unwrap();
         cmdline
-    }
-
-    /// Returns a system resource allocator configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `memory_end` - The first address beyond the end of guest memory.
-    /// * `guest_phys_addr_bits` - Size of guest physical addresses (IPA) in bits.
-    fn get_resource_allocator_config(
-        memory_end: GuestAddress,
-        guest_phys_addr_bits: u8,
-    ) -> SystemAllocatorConfig {
-        let guest_phys_end = 1u64 << guest_phys_addr_bits;
-        // The platform MMIO region is immediately past the end of RAM.
-        let plat_mmio_base = memory_end.offset();
-        let plat_mmio_size = AARCH64_PLATFORM_MMIO_SIZE;
-        // The high MMIO region is the rest of the address space after the platform MMIO region.
-        let high_mmio_base = plat_mmio_base + plat_mmio_size;
-        let high_mmio_size = guest_phys_end
-            .checked_sub(high_mmio_base)
-            .unwrap_or_else(|| {
-                panic!(
-                    "guest_phys_end {:#x} < high_mmio_base {:#x}",
-                    guest_phys_end, high_mmio_base,
-                );
-            });
-        SystemAllocatorConfig {
-            io: None,
-            low_mmio: AddressRange::from_start_and_size(AARCH64_MMIO_BASE, AARCH64_MMIO_SIZE)
-                .expect("invalid mmio region"),
-            high_mmio: AddressRange::from_start_and_size(high_mmio_base, high_mmio_size)
-                .expect("invalid high mmio region"),
-            platform_mmio: Some(
-                AddressRange::from_start_and_size(plat_mmio_base, plat_mmio_size)
-                    .expect("invalid platform mmio region"),
-            ),
-            first_irq: AARCH64_IRQ_BASE,
-        }
     }
 
     /// This adds any early platform devices for this architecture.
