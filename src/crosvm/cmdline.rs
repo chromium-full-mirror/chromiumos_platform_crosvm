@@ -24,6 +24,9 @@ use std::sync::atomic::Ordering;
 
 use arch::CpuSet;
 use arch::FdtPosition;
+#[cfg(target_arch = "x86_64")]
+use arch::MemoryRegionConfig;
+use arch::PciConfig;
 use arch::Pstore;
 #[cfg(target_arch = "x86_64")]
 use arch::SmbiosOptions;
@@ -86,8 +89,6 @@ use crate::crosvm::config::parse_cpu_capacity;
 ))]
 use crate::crosvm::config::parse_cpu_frequencies;
 use crate::crosvm::config::parse_dynamic_power_coefficient;
-#[cfg(target_arch = "x86_64")]
-use crate::crosvm::config::parse_memory_region;
 use crate::crosvm::config::parse_mmio_address_range;
 use crate::crosvm::config::parse_pflash_parameters;
 use crate::crosvm::config::parse_serial_options;
@@ -1387,7 +1388,7 @@ pub struct RunCommand {
     /// Possible key values:
     ///     backend=(2d|virglrenderer|gfxstream) - Which backend to
     ///        use for virtio-gpu (determining rendering protocol)
-    ///     max_num_displays=INT - The maximum number of concurrent
+    ///     max-num-displays=INT - The maximum number of concurrent
     ///        virtual displays in this VM. This must not exceed
     ///        VIRTIO_GPU_MAX_SCANOUTS (i.e. 16).
     ///     displays=[[GpuDisplayParameters]] - The list of virtual
@@ -1785,6 +1786,21 @@ pub struct RunCommand {
     /// extra kernel or plugin command line arguments. Can be given more than once
     pub params: Vec<String>,
 
+    #[argh(option)]
+    #[serde(default)]
+    #[merge(strategy = overwrite_option)]
+    /// PCI parameters.
+    ///
+    /// Possible key values:
+    ///     mem=[start=INT,size=INT] - region for non-prefetchable PCI device memory below 4G
+    ///
+    /// Possible key values (aarch64 only):
+    ///     cam=[start=INT,size=INT] - region for PCI Configuration Access Mechanism
+    ///
+    /// Possible key values (x86_64 only):
+    ///     ecam=[start=INT,size=INT] - region for PCIe Enhanced Configuration Access Mechanism
+    pub pci: Option<PciConfig>,
+
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(option, arg_name = "pci_hotplug_slots")]
     #[serde(default)]
@@ -1798,17 +1814,6 @@ pub struct RunCommand {
     #[merge(strategy = overwrite_option)]
     /// the pci mmio start address below 4G
     pub pci_start: Option<u64>,
-
-    #[cfg(target_arch = "x86_64")]
-    #[argh(
-        option,
-        arg_name = "mmio_base,mmio_length",
-        from_str_fn(parse_memory_region)
-    )]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite_option)]
-    /// region for PCIe Enhanced Configuration Access Mechanism
-    pub pcie_ecam: Option<AddressRange>,
 
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
@@ -3599,16 +3604,27 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.host_cpu_topology = cmd.host_cpu_topology.unwrap_or_default();
 
+        cfg.pci_config = cmd.pci.unwrap_or_default();
+
         #[cfg(target_arch = "x86_64")]
         {
             cfg.break_linux_pci_config_io = cmd.break_linux_pci_config_io.unwrap_or_default();
             cfg.enable_hwp = cmd.enable_hwp.unwrap_or_default();
             cfg.force_s2idle = cmd.s2idle.unwrap_or_default();
-            cfg.pcie_ecam = cmd.pcie_ecam;
-            cfg.pci_low_start = cmd.pci_start;
             cfg.no_i8042 = cmd.no_i8042.unwrap_or_default();
             cfg.no_rtc = cmd.no_rtc.unwrap_or_default();
             cfg.smbios = cmd.smbios.unwrap_or_default();
+
+            if let Some(pci_start) = cmd.pci_start {
+                if cfg.pci_config.mem.is_some() {
+                    return Err("--pci-start cannot be used with --pci mem=[...]".to_string());
+                }
+                log::warn!("`--pci-start` is deprecated; use `--pci mem=[start={pci_start:#?}]");
+                cfg.pci_config.mem = Some(MemoryRegionConfig {
+                    start: pci_start,
+                    size: None,
+                });
+            }
 
             if !cmd.oem_strings.is_empty() {
                 log::warn!(

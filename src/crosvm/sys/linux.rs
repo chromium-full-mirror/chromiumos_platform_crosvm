@@ -507,6 +507,7 @@ fn create_virtio_devices(
     let mut single_touch_idx = 0;
     let mut trackpad_idx = 0;
     let mut multi_touch_trackpad_idx = 0;
+    let mut custom_idx = 0;
     for input in &cfg.virtio_input {
         let input_dev = match input {
             InputDeviceOption::Evdev { path } => {
@@ -642,6 +643,17 @@ fn create_virtio_devices(
                     multi_touch_trackpad_idx,
                 )?;
                 multi_touch_trackpad_idx += 1;
+                dev
+            }
+            InputDeviceOption::Custom { path, config_path } => {
+                let dev = create_custom_device(
+                    cfg.protection_type,
+                    &cfg.jail_config,
+                    path.as_path(),
+                    custom_idx,
+                    config_path.clone(),
+                )?;
+                custom_idx += 1;
                 dev
             }
         };
@@ -1498,10 +1510,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         #[cfg(target_arch = "x86_64")]
         force_s2idle: cfg.force_s2idle,
         pvm_fw: pvm_fw_image,
-        #[cfg(target_arch = "x86_64")]
-        pcie_ecam: cfg.pcie_ecam,
-        #[cfg(target_arch = "x86_64")]
-        pci_low_start: cfg.pci_low_start,
+        pci_config: cfg.pci_config,
         dynamic_power_coefficient: cfg.dynamic_power_coefficient.clone(),
         boot_cpu: cfg.boot_cpu,
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
