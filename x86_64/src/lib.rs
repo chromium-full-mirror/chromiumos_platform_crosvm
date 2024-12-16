@@ -293,6 +293,8 @@ pub enum Error {
     SetupSmbios(smbios::Error),
     #[error("failed to set up sregs: {0}")]
     SetupSregs(base::Error),
+    #[error("too many vCPUs")]
+    TooManyVcpus,
     #[error("failed to translate virtual address")]
     TranslatingVirtAddr,
     #[error("protected VMs not supported on x86_64")]
@@ -736,26 +738,18 @@ pub fn arch_memory_regions(
         }
     }
 
-    let mem_end = GuestAddress(mem_size);
+    let mem_below_4g = max_ram_end_before_32bit(arch_memory_layout).min(mem_size);
+    regions.push((
+        GuestAddress(0),
+        mem_below_4g,
+        MemoryRegionOptions::new().purpose(MemoryRegionPurpose::GuestMemoryRegion),
+    ));
 
-    let first_addr_past_32bits = GuestAddress(FIRST_ADDR_PAST_32BITS);
-    let max_end_32bits = GuestAddress(max_ram_end_before_32bit(arch_memory_layout));
-
-    if mem_end <= max_end_32bits {
+    let mem_above_4g = mem_size.saturating_sub(mem_below_4g);
+    if mem_above_4g > 0 {
         regions.push((
-            GuestAddress(0),
-            mem_size,
-            MemoryRegionOptions::new().purpose(MemoryRegionPurpose::GuestMemoryRegion),
-        ));
-    } else {
-        regions.push((
-            GuestAddress(0),
-            max_end_32bits.offset(),
-            MemoryRegionOptions::new().purpose(MemoryRegionPurpose::GuestMemoryRegion),
-        ));
-        regions.push((
-            first_addr_past_32bits,
-            mem_end.offset_from(max_end_32bits),
+            GuestAddress(FIRST_ADDR_PAST_32BITS),
+            mem_above_4g,
             MemoryRegionOptions::new().purpose(MemoryRegionPurpose::GuestMemoryRegion),
         ));
     }
@@ -764,7 +758,7 @@ pub fn arch_memory_regions(
         regions.push((
             bios_start(bios_size),
             bios_size,
-            MemoryRegionOptions::new().purpose(MemoryRegionPurpose::GuestMemoryRegion),
+            MemoryRegionOptions::new().purpose(MemoryRegionPurpose::Bios),
         ));
     }
 
@@ -1086,6 +1080,12 @@ impl arch::LinuxArch for X8664arch {
         // tables and the guest OS picks them up.
         // If another guest does need a way to pass these tables down to it's BIOS, this approach
         // should be rethought.
+
+        // Make sure the `vcpu_count` casts below and the arithmetic in `setup_mptable` are well
+        // defined.
+        if vcpu_count >= u8::max_value().into() {
+            return Err(Error::TooManyVcpus);
+        }
 
         if mptable {
             // Note that this puts the mptable at 0x9FC00 in guest physical memory.
@@ -2473,7 +2473,7 @@ mod tests {
                     bios_len,
                     MemoryRegionOptions {
                         align: 0,
-                        purpose: MemoryRegionPurpose::GuestMemoryRegion,
+                        purpose: MemoryRegionPurpose::Bios,
                     },
                 ),
             ]
@@ -2501,7 +2501,7 @@ mod tests {
                     bios_len,
                     MemoryRegionOptions {
                         align: 0,
-                        purpose: MemoryRegionPurpose::GuestMemoryRegion,
+                        purpose: MemoryRegionPurpose::Bios,
                     },
                 ),
                 (
@@ -2556,7 +2556,7 @@ mod tests {
                     bios_len,
                     MemoryRegionOptions {
                         align: 0,
-                        purpose: MemoryRegionPurpose::GuestMemoryRegion,
+                        purpose: MemoryRegionPurpose::Bios,
                     },
                 ),
             ]
