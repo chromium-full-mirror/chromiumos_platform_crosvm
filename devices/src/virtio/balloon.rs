@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-mod sys;
-
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -245,11 +243,14 @@ struct virtio_balloon_op {
 
 fn invoke_desc_handler<F>(ranges: Vec<(u64, u64)>, desc_handler: &mut F)
 where
-    F: FnMut(GuestAddress, u64),
+    F: FnMut(Vec<(GuestAddress, u64)>),
 {
-    for range in ranges {
-        desc_handler(GuestAddress(range.0), range.1);
-    }
+    desc_handler(
+        ranges
+            .into_iter()
+            .map(|range| (GuestAddress(range.0), range.1))
+            .collect(),
+    );
 }
 
 // Release a list of guest memory ranges back to the host system.
@@ -261,7 +262,7 @@ fn release_ranges<F>(
     desc_handler: &mut F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(GuestAddress, u64),
+    F: FnMut(Vec<(GuestAddress, u64)>),
 {
     if let Some(tube) = release_memory_tube {
         let unpin_ranges = inflate_ranges
@@ -301,7 +302,7 @@ fn handle_address_chain<F>(
     desc_handler: &mut F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(GuestAddress, u64),
+    F: FnMut(Vec<(GuestAddress, u64)>),
 {
     // In a long-running system, there is no reason to expect that
     // a significant number of freed pages are consecutive. However,
@@ -350,7 +351,7 @@ async fn handle_queue<F>(
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Queue
 where
-    F: FnMut(GuestAddress, u64),
+    F: FnMut(Vec<(GuestAddress, u64)>),
 {
     loop {
         let mut avail_desc = match queue
@@ -381,7 +382,7 @@ fn handle_reported_buffer<F>(
     desc_handler: &mut F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(GuestAddress, u64),
+    F: FnMut(Vec<(GuestAddress, u64)>),
 {
     let reported_ranges: Vec<(u64, u64)> = avail_desc
         .reader
@@ -402,7 +403,7 @@ async fn handle_reporting_queue<F>(
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Queue
 where
-    F: FnMut(GuestAddress, u64),
+    F: FnMut(Vec<(GuestAddress, u64)>),
 {
     loop {
         let avail_desc = match queue
@@ -847,6 +848,33 @@ impl From<Box<PausedQueues>> for BTreeMap<usize, Queue> {
     }
 }
 
+fn free_memory(
+    vm_memory_client: &VmMemoryClient,
+    mem: &GuestMemory,
+    ranges: Vec<(GuestAddress, u64)>,
+) {
+    // When `--lock-guest-memory` is used, it is not possible to free the memory from the main
+    // process, so we free it from the sandboxed balloon process directly.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    if mem.locked() {
+        for (guest_address, len) in ranges {
+            if let Err(e) = mem.remove_range(guest_address, len) {
+                warn!("Marking pages unused failed: {}, addr={}", e, guest_address);
+            }
+        }
+        return;
+    }
+    if let Err(e) = vm_memory_client.dynamically_free_memory_ranges(ranges) {
+        warn!("Failed to dynamically free memory ranges: {e:#}");
+    }
+}
+
+fn reclaim_memory(vm_memory_client: &VmMemoryClient, ranges: Vec<(GuestAddress, u64)>) {
+    if let Err(e) = vm_memory_client.dynamically_reclaim_memory_ranges(ranges) {
+        warn!("Failed to dynamically reclaim memory range: {e:#}");
+    }
+}
+
 /// Stores data from the worker when it stops so that data can be re-used when
 /// the worker is restarted.
 struct WorkerReturn {
@@ -869,6 +897,7 @@ fn run_worker(
     ws_op_queue: Option<Queue>,
     command_tube: Tube,
     vm_memory_client: VmMemoryClient,
+    mem: GuestMemory,
     release_memory_tube: Option<Tube>,
     interrupt: Interrupt,
     kill_evt: Event,
@@ -898,7 +927,7 @@ fn run_worker(
             inflate_queue,
             EventAsync::new(inflate_queue_evt, &ex).expect("failed to create async event"),
             release_memory_tube.as_ref(),
-            |guest_address, len| sys::free_memory(&guest_address, len, &vm_memory_client),
+            |ranges| free_memory(&vm_memory_client, &mem, ranges),
             stop_rx,
         );
         let inflate = inflate.fuse();
@@ -914,7 +943,7 @@ fn run_worker(
             deflate_queue,
             EventAsync::new(deflate_queue_evt, &ex).expect("failed to create async event"),
             None,
-            |guest_address, len| sys::reclaim_memory(&guest_address, len, &vm_memory_client),
+            |ranges| reclaim_memory(&vm_memory_client, ranges),
             stop_rx,
         );
         let deflate = deflate.fuse();
@@ -958,7 +987,7 @@ fn run_worker(
                 reporting_queue,
                 EventAsync::new(reporting_queue_evt, &ex).expect("failed to create async event"),
                 release_memory_tube.as_ref(),
-                |guest_address, len| sys::free_memory(&guest_address, len, &vm_memory_client),
+                |ranges| free_memory(&vm_memory_client, &mem, ranges),
                 stop_rx,
             )
             .left_future()
@@ -1128,7 +1157,9 @@ async fn handle_target_reached(
         let _ = event_async.next_val().await;
         // Send the message to vm_control on the event. We don't have to read the current
         // size yet.
-        sys::balloon_target_reached(0, vm_memory_client);
+        if let Err(e) = vm_memory_client.balloon_target_reached(0) {
+            warn!("Failed to send or receive allocation complete request: {e:#}");
+        }
     }
     // The above loop will never terminate and there is no reason to terminate it either. However,
     // the function is used in an executor that expects a Result<> return. Make sure that clippy
@@ -1293,7 +1324,12 @@ impl Balloon {
         Ok(queue_struct)
     }
 
-    fn start_worker(&mut self, interrupt: Interrupt, queues: BalloonQueues) -> anyhow::Result<()> {
+    fn start_worker(
+        &mut self,
+        mem: GuestMemory,
+        interrupt: Interrupt,
+        queues: BalloonQueues,
+    ) -> anyhow::Result<()> {
         let (self_target_reached_evt, target_reached_evt) = Event::new()
             .and_then(|e| Ok((e.try_clone()?, e)))
             .context("failed to create target_reached Event pair: {}")?;
@@ -1322,6 +1358,7 @@ impl Balloon {
                 queues.ws_op,
                 command_tube,
                 vm_memory_client,
+                mem,
                 release_memory_tube,
                 interrupt,
                 kill_evt,
@@ -1405,12 +1442,12 @@ impl VirtioDevice for Balloon {
 
     fn activate(
         &mut self,
-        _mem: GuestMemory,
+        mem: GuestMemory,
         interrupt: Interrupt,
         queues: BTreeMap<usize, Queue>,
     ) -> anyhow::Result<()> {
         let queues = self.get_queues_from_map(queues)?;
-        self.start_worker(interrupt, queues)
+        self.start_worker(mem, interrupt, queues)
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
@@ -1435,13 +1472,13 @@ impl VirtioDevice for Balloon {
         &mut self,
         queues_state: Option<(GuestMemory, Interrupt, BTreeMap<usize, Queue>)>,
     ) -> anyhow::Result<()> {
-        if let Some((_mem, interrupt, queues)) = queues_state {
+        if let Some((mem, interrupt, queues)) = queues_state {
             if queues.len() < 2 {
                 anyhow::bail!("{} queues were found, but an activated balloon must have at least 2 active queues.", queues.len());
             }
 
             let balloon_queues = self.get_queues_from_map(queues)?;
-            self.start_worker(interrupt, balloon_queues)?;
+            self.start_worker(mem, interrupt, balloon_queues)?;
         }
         Ok(())
     }
@@ -1513,8 +1550,8 @@ mod tests {
         .expect("create_descriptor_chain failed");
 
         let mut addrs = Vec::new();
-        let res = handle_address_chain(None, &mut chain, &mut |guest_address, len| {
-            addrs.push((guest_address, len));
+        let res = handle_address_chain(None, &mut chain, &mut |mut ranges| {
+            addrs.append(&mut ranges)
         });
         assert!(res.is_ok());
         assert_eq!(addrs.len(), 2);
