@@ -85,6 +85,12 @@ pub fn log_metric(event_code: MetricEventType, value: i64) {
     }
 }
 
+pub fn log_metric_with_details(event_code: MetricEventType, _: i64,  _: &RecordDetails) {
+    if MetricsRequestHandler::will_log_event(&event_code) {
+        unimplemented!()
+    }
+}
+
 pub fn log_histogram_metric(event_code: MetricEventType, value: i64) {
     log_metric(event_code, value)
 }
