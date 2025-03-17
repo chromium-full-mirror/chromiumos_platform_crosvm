@@ -56,6 +56,7 @@ use anyhow::bail;
 use anyhow::Context;
 use base::error;
 use base::info;
+#[cfg(target_arch = "x86_64")]
 use base::warn;
 use base::with_as_descriptor;
 use base::AsRawDescriptor;
@@ -351,6 +352,9 @@ pub enum DeviceControlCommand {
     RestoreDevices {
         snapshot_reader: SnapshotReader,
     },
+    RestoreMemory {
+        snapshot_reader: SnapshotReader,
+    },
     GetDevicesState,
     Exit,
 }
@@ -373,6 +377,7 @@ pub enum IrqHandlerRequest {
     Exit,
 }
 
+#[cfg(target_arch = "x86_64")]
 const EXPECTED_MAX_IRQ_FLUSH_ITERATIONS: usize = 100;
 
 /// Response for [IrqHandlerRequest].
@@ -1516,6 +1521,8 @@ pub enum VmRequest {
     VcpuPidTid,
     /// Throttles the requested vCPU for microseconds
     Throttle(usize, u32),
+    /// Returns unique descriptor of this VM.
+    GetVmDescriptor,
 }
 
 /// NOTE: when making any changes to this enum please also update
@@ -1800,7 +1807,7 @@ impl VmRequest {
         #[cfg(feature = "swap")] swap_controller: Option<&swap::SwapController>,
         device_control_tube: &Tube,
         vcpu_size: usize,
-        irq_handler_control: &Tube,
+        #[cfg(target_arch = "x86_64")] irq_handler_control: &Tube,
         snapshot_irqchip: impl Fn() -> anyhow::Result<AnySnapshot>,
         suspended_pvclock_state: &mut Option<hypervisor::ClockState>,
     ) -> VmResponse {
@@ -2218,6 +2225,7 @@ impl VmRequest {
                 match do_snapshot(
                     snapshot_path.to_path_buf(),
                     kick_vcpus,
+                    #[cfg(target_arch = "x86_64")]
                     irq_handler_control,
                     device_control_tube,
                     vcpu_size,
@@ -2248,6 +2256,19 @@ impl VmRequest {
             VmRequest::Unregister { socket_addr: _ } => VmResponse::Ok,
             VmRequest::VcpuPidTid => unreachable!(),
             VmRequest::Throttle(_, _) => unreachable!(),
+            VmRequest::GetVmDescriptor => {
+                let vm_fd = match vm.try_clone_descriptor() {
+                    Ok(vm_fd) => vm_fd,
+                    Err(e) => {
+                        error!("failed to get vm_fd: {:?}", e);
+                        return VmResponse::Err(e);
+                    }
+                };
+                VmResponse::VmDescriptor {
+                    hypervisor: vm.hypervisor_kind(),
+                    vm_fd,
+                }
+            }
         }
     }
 }
@@ -2256,7 +2277,7 @@ impl VmRequest {
 fn do_snapshot(
     snapshot_path: PathBuf,
     kick_vcpus: impl Fn(VcpuControl),
-    irq_handler_control: &Tube,
+    #[cfg(target_arch = "x86_64")] irq_handler_control: &Tube,
     device_control_tube: &Tube,
     vcpu_size: usize,
     snapshot_irqchip: impl Fn() -> anyhow::Result<AnySnapshot>,
@@ -2270,7 +2291,7 @@ fn do_snapshot(
     let _vcpu_guard = VcpuSuspendGuard::new(&kick_vcpus, vcpu_size)?;
     let _device_guard = DeviceSleepGuard::new(device_control_tube)?;
 
-    // We want to flush all pending IRQs to the LAPICs. There are two cases:
+    // On x86, We want to flush all pending IRQs to the LAPICs. There are two cases:
     //
     // MSIs: these are directly delivered to the LAPIC. We must verify the handler
     // thread cycles once to deliver these interrupts.
@@ -2290,29 +2311,35 @@ fn do_snapshot(
     // Note: within CrosVM, *all* interrupts are eventually converted into the
     // same mechanicism that MSIs use. This is why we say "underlying" MSI for
     // a legacy IRQ.
-    let mut flush_attempts = 0;
-    loop {
-        irq_handler_control
-            .send(&IrqHandlerRequest::WakeAndNotifyIteration)
-            .context("failed to send flush command to IRQ handler thread")?;
-        let resp = irq_handler_control
-            .recv()
-            .context("failed to recv flush response from IRQ handler thread")?;
-        match resp {
-            IrqHandlerResponse::HandlerIterationComplete(tokens_serviced) => {
-                if tokens_serviced == 0 {
-                    break;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut flush_attempts = 0;
+        loop {
+            irq_handler_control
+                .send(&IrqHandlerRequest::WakeAndNotifyIteration)
+                .context("failed to send flush command to IRQ handler thread")?;
+            let resp = irq_handler_control
+                .recv()
+                .context("failed to recv flush response from IRQ handler thread")?;
+            match resp {
+                IrqHandlerResponse::HandlerIterationComplete(tokens_serviced) => {
+                    if tokens_serviced == 0 {
+                        break;
+                    }
                 }
+                _ => bail!("received unexpected reply from IRQ handler: {:?}", resp),
             }
-            _ => bail!("received unexpected reply from IRQ handler: {:?}", resp),
+            flush_attempts += 1;
+            if flush_attempts > EXPECTED_MAX_IRQ_FLUSH_ITERATIONS {
+                warn!(
+                    "flushing IRQs for snapshot may be stalled after iteration {}, expected <= {}
+                      iterations",
+                    flush_attempts, EXPECTED_MAX_IRQ_FLUSH_ITERATIONS
+                );
+            }
         }
-        flush_attempts += 1;
-        if flush_attempts > EXPECTED_MAX_IRQ_FLUSH_ITERATIONS {
-            warn!("flushing IRQs for snapshot may be stalled after iteration {}, expected <= {} iterations", flush_attempts, EXPECTED_MAX_IRQ_FLUSH_ITERATIONS);
-        }
+        info!("flushed IRQs in {} iterations", flush_attempts);
     }
-    info!("flushed IRQs in {} iterations", flush_attempts);
-
     let snapshot_writer = SnapshotWriter::new(snapshot_path, encrypt)?;
 
     // Snapshot hypervisor's paravirtualized clock.
@@ -2380,7 +2407,7 @@ pub fn do_restore(
     restore_path: &Path,
     kick_vcpus: impl Fn(VcpuControl),
     kick_vcpu: impl Fn(VcpuControl, usize),
-    irq_handler_control: &Tube,
+    #[cfg(target_arch = "x86_64")] irq_handler_control: &Tube,
     device_control_tube: &Tube,
     vcpu_size: usize,
     mut restore_irqchip: impl FnMut(AnySnapshot) -> anyhow::Result<()>,
@@ -2394,8 +2421,30 @@ pub fn do_restore(
 
     let snapshot_reader = SnapshotReader::new(restore_path, require_encrypted)?;
 
-    // Restore hypervisor's paravirtualized clock.
-    *suspended_pvclock_state = snapshot_reader.read_fragment("pvclock")?;
+    // Restore Memory
+    device_control_tube
+        .send(&DeviceControlCommand::RestoreMemory {
+            snapshot_reader: snapshot_reader.clone(),
+        })
+        .context("send restore memory command to devices control socket")?;
+    let resp_mem: VmResponse = device_control_tube
+        .recv()
+        .context("receive from devices control socket")?;
+    if !matches!(resp_mem, VmResponse::Ok) {
+        bail!("unexpected RestoreMemory response from Mem: {resp_mem}");
+    }
+    // Restore devices
+    device_control_tube
+        .send(&DeviceControlCommand::RestoreDevices {
+            snapshot_reader: snapshot_reader.clone(),
+        })
+        .context("send restore devices command to devices control socket")?;
+    let resp: VmResponse = device_control_tube
+        .recv()
+        .context("receive from devices control socket")?;
+    if !matches!(resp, VmResponse::Ok) {
+        bail!("unexpected RestoreDevices response: {resp}");
+    }
 
     // Restore IrqChip
     let irq_snapshot: AnySnapshot = snapshot_reader.read_fragment("irqchip")?;
@@ -2435,29 +2484,25 @@ pub fn do_restore(
             .context("Failed to restore vcpu")?;
     }
 
-    // Restore devices
-    device_control_tube
-        .send(&DeviceControlCommand::RestoreDevices { snapshot_reader })
-        .context("send command to devices control socket")?;
-    let resp: VmResponse = device_control_tube
-        .recv()
-        .context("receive from devices control socket")?;
-    if !matches!(resp, VmResponse::Ok) {
-        bail!("unexpected RestoreDevices response: {resp}");
+    // On x86, refresh the IRQ tokens. On Arm64, they are saved and restored as part of the VGIC.
+    #[cfg(target_arch = "x86_64")]
+    {
+        irq_handler_control
+            .send(&IrqHandlerRequest::RefreshIrqEventTokens)
+            .context("failed to send refresh irq event token command to IRQ handler thread")?;
+        let resp: IrqHandlerResponse = irq_handler_control
+            .recv()
+            .context("failed to recv refresh response from IRQ handler thread")?;
+        if !matches!(resp, IrqHandlerResponse::IrqEventTokenRefreshComplete) {
+            bail!(
+                "received unexpected reply from IRQ handler thread: {:?}",
+                resp
+            );
+        }
     }
 
-    irq_handler_control
-        .send(&IrqHandlerRequest::RefreshIrqEventTokens)
-        .context("failed to send refresh irq event token command to IRQ handler thread")?;
-    let resp: IrqHandlerResponse = irq_handler_control
-        .recv()
-        .context("failed to recv refresh response from IRQ handler thread")?;
-    if !matches!(resp, IrqHandlerResponse::IrqEventTokenRefreshComplete) {
-        bail!(
-            "received unexpected reply from IRQ handler thread: {:?}",
-            resp
-        );
-    }
+    // Restore hypervisor's paravirtualized clock.
+    *suspended_pvclock_state = snapshot_reader.read_fragment("pvclock")?;
 
     let restore_duration_ms = restore_start.elapsed().as_millis();
     info!(
@@ -2465,6 +2510,7 @@ pub fn do_restore(
         restore_duration_ms,
         vm.get_memory().memory_size(),
     );
+
     metrics::log_metric_with_details(
         metrics::MetricEventType::SnapshotRestoreOverallLatency,
         restore_duration_ms as i64,
@@ -2472,6 +2518,8 @@ pub fn do_restore(
     );
     Ok(())
 }
+
+pub type HypervisorKind = hypervisor::HypervisorKind;
 
 /// Indication of success or failure of a `VmRequest`.
 ///
@@ -2516,6 +2564,10 @@ pub enum VmResponse {
     /// Map of the Vcpu PID/TIDs
     VcpuPidTidResponse {
         pid_tid_map: BTreeMap<usize, (u32, u32)>,
+    },
+    VmDescriptor {
+        hypervisor: HypervisorKind,
+        vm_fd: SafeDescriptor,
     },
 }
 
@@ -2567,6 +2619,9 @@ impl Display for VmResponse {
             }
             DevicesState(status) => write!(f, "devices status: {:?}", status),
             VcpuPidTidResponse { pid_tid_map } => write!(f, "vcpu pid tid map: {:?}", pid_tid_map),
+            VmDescriptor { hypervisor, vm_fd } => {
+                write!(f, "hypervisor: {:?}, vm_fd: {:?}", hypervisor, vm_fd)
+            }
         }
     }
 }
