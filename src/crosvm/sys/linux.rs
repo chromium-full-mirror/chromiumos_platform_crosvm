@@ -1859,6 +1859,8 @@ fn run_kvm(device_path: Option<&Path>, cfg: Config, components: VmComponents) ->
 #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
 fn run_gunyah(
     device_path: Option<&Path>,
+    qcom_trusted_vm_id: Option<u16>,
+    qcom_trusted_vm_pas_id: Option<u32>,
     cfg: Config,
     components: VmComponents,
 ) -> Result<ExitState> {
@@ -1885,7 +1887,14 @@ fn run_gunyah(
         None
     };
 
-    let vm = GunyahVm::new(&gunyah, guest_mem, components.hv_cfg).context("failed to create vm")?;
+    let vm = GunyahVm::new(
+        &gunyah,
+        qcom_trusted_vm_id,
+        qcom_trusted_vm_pas_id,
+        guest_mem,
+        components.hv_cfg,
+    )
+    .context("failed to create vm")?;
 
     // Check that the VM was actually created in protected mode as expected.
     if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
@@ -1936,6 +1945,8 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
         if gunyah_path.exists() {
             return Some(HypervisorKind::Gunyah {
                 device: Some(gunyah_path.to_path_buf()),
+                qcom_trusted_vm_id: None,
+                qcom_trusted_vm_pas_id: None,
             });
         }
     }
@@ -1964,7 +1975,17 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             any(target_arch = "arm", target_arch = "aarch64"),
             feature = "gunyah"
         ))]
-        HypervisorKind::Gunyah { device } => run_gunyah(device.as_deref(), cfg, components),
+        HypervisorKind::Gunyah {
+            device,
+            qcom_trusted_vm_id,
+            qcom_trusted_vm_pas_id,
+        } => run_gunyah(
+            device.as_deref(),
+            qcom_trusted_vm_id,
+            qcom_trusted_vm_pas_id,
+            cfg,
+            components,
+        ),
     }
 }
 
@@ -3051,7 +3072,6 @@ struct ControlLoopState<'a, V: VmArch, Vcpu: VcpuArch> {
     #[cfg(feature = "balloon")]
     balloon_tube: Option<&'a mut BalloonTube>,
     device_ctrl_tube: &'a Tube,
-    #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
     irq_handler_control: &'a Tube,
     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
     vm_memory_handler_control: &'a Tube,
@@ -3276,7 +3296,6 @@ fn process_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 state.swap_controller.as_ref(),
                 state.device_ctrl_tube,
                 state.vcpu_handles.len(),
-                #[cfg(target_arch = "x86_64")]
                 state.irq_handler_control,
                 || state.linux.irq_chip.snapshot(state.linux.vcpu_count),
                 state.suspended_pvclock_state,
@@ -3945,7 +3964,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             |msg, index| {
                 vcpu::kick_vcpu(&vcpu_handles.get(index), linux.irq_chip.as_irq_chip(), msg)
             },
-            #[cfg(target_arch = "x86_64")]
             &irq_handler_control,
             &device_ctrl_tube,
             linux.vcpu_count,
@@ -4196,7 +4214,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                             #[cfg(feature = "balloon")]
                             balloon_tube: balloon_tube.as_mut(),
                             device_ctrl_tube: &device_ctrl_tube,
-                            #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
                             irq_handler_control: &irq_handler_control,
                             #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
                             vm_memory_handler_control: &vm_memory_handler_control,
