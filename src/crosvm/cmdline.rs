@@ -2228,6 +2228,8 @@ pub struct RunCommand {
     ///        Can only be given once. Will default to first serial
     ///        port if not provided.
     ///     pci-address - Preferred PCI address, e.g. "00:01.0".
+    ///     max-queue-sizes=[uint,uint] - Max size of each virtio
+    ///        queue. Only applicable when hardware=virtio-console.
     pub serial: Vec<SerialParameters>,
 
     #[cfg(windows)]
@@ -2678,6 +2680,8 @@ pub struct RunCommand {
     ///     cid=CID - CID to use for the device.
     ///     device=VHOST_DEVICE - path to the vhost-vsock device to
     ///         use (Linux only). Defaults to /dev/vhost-vsock.
+    ///     max-queue-sizes=[uint,uint,uint] - Max size of each
+    ///         virtio queue.
     pub vsock: Option<VsockConfig>,
 
     #[cfg(feature = "vtpm")]
