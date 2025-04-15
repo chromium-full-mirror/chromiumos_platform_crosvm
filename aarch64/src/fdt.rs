@@ -10,6 +10,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use arch::apply_device_tree_overlays;
+use arch::fdt::create_memory_node;
+use arch::fdt::create_reserved_memory_node;
+use arch::fdt::ReservedMemoryRegion;
 use arch::serial::SerialDeviceInfo;
 use arch::CpuSet;
 use arch::DtbOverlay;
@@ -33,8 +36,6 @@ use rand::RngCore;
 use resources::AddressRange;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
-use vm_memory::MemoryRegionInformation;
-use vm_memory::MemoryRegionPurpose;
 
 // These are GIC address-space location constants.
 use crate::AARCH64_GIC_CPUI_BASE;
@@ -77,71 +78,6 @@ const GIC_FDT_IRQ_PPI_CPU_MASK: u32 = 0xff << GIC_FDT_IRQ_PPI_CPU_SHIFT;
 const IRQ_TYPE_EDGE_RISING: u32 = 0x00000001;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 0x00000004;
 const IRQ_TYPE_LEVEL_LOW: u32 = 0x00000008;
-
-fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
-    let mut mem_reg_prop = Vec::new();
-    let mut previous_memory_region_end = None;
-    let mut regions: Vec<MemoryRegionInformation> = guest_mem
-        .regions()
-        .filter(|region| match region.options.purpose {
-            MemoryRegionPurpose::Bios => false,
-            MemoryRegionPurpose::GuestMemoryRegion => true,
-            MemoryRegionPurpose::ProtectedFirmwareRegion => false,
-            MemoryRegionPurpose::ReservedMemory => false,
-            MemoryRegionPurpose::StaticSwiotlbRegion => true,
-        })
-        .collect();
-    regions.sort_by(|a, b| a.guest_addr.cmp(&b.guest_addr));
-    for region in regions {
-        // Merge with the previous region if possible.
-        if let Some(previous_end) = previous_memory_region_end {
-            if region.guest_addr == previous_end {
-                *mem_reg_prop.last_mut().unwrap() += region.size as u64;
-                previous_memory_region_end =
-                    Some(previous_end.checked_add(region.size as u64).unwrap());
-                continue;
-            }
-            assert!(region.guest_addr > previous_end, "Memory regions overlap");
-        }
-
-        mem_reg_prop.push(region.guest_addr.offset());
-        mem_reg_prop.push(region.size as u64);
-        previous_memory_region_end =
-            Some(region.guest_addr.checked_add(region.size as u64).unwrap());
-    }
-
-    let memory_node = fdt.root_mut().subnode_mut("memory")?;
-    memory_node.set_prop("device_type", "memory")?;
-    memory_node.set_prop("reg", mem_reg_prop)?;
-    Ok(())
-}
-
-fn create_resv_memory_node(
-    fdt: &mut Fdt,
-    resv_addr_and_size: (Option<GuestAddress>, u64),
-) -> Result<u32> {
-    let (resv_addr, resv_size) = resv_addr_and_size;
-
-    let resv_memory_node = fdt.root_mut().subnode_mut("reserved-memory")?;
-    resv_memory_node.set_prop("#address-cells", 0x2u32)?;
-    resv_memory_node.set_prop("#size-cells", 0x2u32)?;
-    resv_memory_node.set_prop("ranges", ())?;
-
-    let restricted_dma_pool_node = if let Some(resv_addr) = resv_addr {
-        let node =
-            resv_memory_node.subnode_mut(&format!("restricted_dma_reserved@{:x}", resv_addr.0))?;
-        node.set_prop("reg", &[resv_addr.0, resv_size])?;
-        node
-    } else {
-        let node = resv_memory_node.subnode_mut("restricted_dma_reserved")?;
-        node.set_prop("size", resv_size)?;
-        node
-    };
-    restricted_dma_pool_node.set_prop("phandle", PHANDLE_RESTRICTED_DMA_POOL)?;
-    restricted_dma_pool_node.set_prop("compatible", "restricted-dma-pool")?;
-    restricted_dma_pool_node.set_prop("alignment", base::pagesize() as u64)?;
-    Ok(PHANDLE_RESTRICTED_DMA_POOL)
-}
 
 fn create_cpu_nodes(
     fdt: &mut Fdt,
@@ -692,6 +628,7 @@ pub fn create_fdt(
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
     let mut phandles = BTreeMap::new();
+    let mut reserved_memory_regions = Vec::new();
 
     // The whole thing is put into one giant node with some top level properties
     let root_node = fdt.root_mut();
@@ -709,14 +646,27 @@ pub fn create_fdt(
     create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref())?;
     create_config_node(&mut fdt, kernel_region)?;
     create_memory_node(&mut fdt, guest_mem)?;
-    let dma_pool_phandle = match swiotlb {
-        Some(x) => {
-            let phandle = create_resv_memory_node(&mut fdt, x)?;
-            phandles.insert("restricted_dma_reserved", phandle);
-            Some(phandle)
-        }
-        None => None,
+
+    let dma_pool_phandle = if let Some((swiotlb_addr, swiotlb_size)) = swiotlb {
+        let phandle = PHANDLE_RESTRICTED_DMA_POOL;
+        reserved_memory_regions.push(ReservedMemoryRegion {
+            address: swiotlb_addr,
+            size: swiotlb_size,
+            phandle: Some(phandle),
+            name: "restricted_dma_reserved",
+            compatible: Some("restricted-dma-pool"),
+            alignment: Some(base::pagesize() as u64),
+        });
+        phandles.insert("restricted_dma_reserved", phandle);
+        Some(phandle)
+    } else {
+        None
     };
+
+    if !reserved_memory_regions.is_empty() {
+        create_reserved_memory_node(&mut fdt, &reserved_memory_regions)?;
+    }
+
     create_cpu_nodes(
         &mut fdt,
         num_cpus,
