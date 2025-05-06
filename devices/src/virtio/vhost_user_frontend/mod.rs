@@ -5,7 +5,6 @@
 //! VirtioDevice implementation for the VMM side of a vhost-user connection.
 
 mod error;
-mod fs;
 mod handler;
 mod sys;
 mod worker;
@@ -36,7 +35,6 @@ use vmm_vhost::VhostUserMemoryRegionInfo;
 use vmm_vhost::VringConfigData;
 use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 
-use crate::virtio::copy_config;
 use crate::virtio::device_constants::VIRTIO_DEVICE_TYPE_SPECIFIC_FEATURES_MASK;
 use crate::virtio::vhost_user_frontend::error::Error;
 use crate::virtio::vhost_user_frontend::error::Result;
@@ -59,6 +57,7 @@ pub struct VhostUserFrontend {
     backend_client: Arc<Mutex<BackendClient>>,
     avail_features: u64,
     acked_features: u64,
+    sent_set_features: bool,
     protocol_features: VhostUserProtocolFeatures,
     // `backend_req_handler` is only present if the backend supports BACKEND_REQ. `worker_thread`
     // takes ownership of `backend_req_handler` when it starts. The worker thread will always
@@ -68,7 +67,6 @@ pub struct VhostUserFrontend {
     shmem_region: RefCell<Option<Option<SharedMemoryRegion>>>,
 
     queue_sizes: Vec<u16>,
-    cfg: Option<Vec<u8>>,
     expose_shmem_descriptors_with_viommu: bool,
     pci_address: Option<PciAddress>,
 
@@ -101,37 +99,9 @@ impl VhostUserFrontend {
     /// - `max_queue_size`: maximum number of entries in each queue (default: [`Queue::MAX_SIZE`])
     pub fn new(
         device_type: DeviceType,
-        base_features: u64,
-        connection: vmm_vhost::Connection<vmm_vhost::FrontendReq>,
-        max_queue_size: Option<u16>,
-        pci_address: Option<PciAddress>,
-    ) -> Result<VhostUserFrontend> {
-        VhostUserFrontend::new_internal(
-            connection,
-            device_type,
-            max_queue_size,
-            base_features,
-            None, // cfg
-            pci_address,
-        )
-    }
-
-    /// Create a new VirtioDevice for a vhost-user device frontend.
-    ///
-    /// # Arguments
-    ///
-    /// - `connection`: connection to the device backend
-    /// - `device_type`: virtio device type
-    /// - `max_queue_size`: maximum number of entries in each queue (default: [`Queue::MAX_SIZE`])
-    /// - `base_features`: base virtio device features (e.g. `VIRTIO_F_VERSION_1`)
-    /// - `cfg`: bytes to return for the virtio configuration space (queried from device if not
-    ///   specified)
-    pub(crate) fn new_internal(
-        connection: vmm_vhost::Connection<vmm_vhost::FrontendReq>,
-        device_type: DeviceType,
-        max_queue_size: Option<u16>,
         mut base_features: u64,
-        cfg: Option<&[u8]>,
+        connection: vmm_vhost::Connection<vmm_vhost::FrontendReq>,
+        max_queue_size: Option<u16>,
         pci_address: Option<PciAddress>,
     ) -> Result<VhostUserFrontend> {
         // Don't allow packed queues even if requested. We don't handle them properly yet at the
@@ -176,10 +146,13 @@ impl VhostUserFrontend {
 
         let mut protocol_features = VhostUserProtocolFeatures::empty();
         if avail_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES != 0 {
-            // The vhost-user backend supports VHOST_USER_F_PROTOCOL_FEATURES; enable it.
-            backend_client
-                .set_features(1 << VHOST_USER_F_PROTOCOL_FEATURES)
-                .map_err(Error::SetFeatures)?;
+            // The vhost-user backend supports VHOST_USER_F_PROTOCOL_FEATURES.
+            // Per the vhost-user protocol, the backend must support
+            // `VHOST_USER_GET_PROTOCOL_FEATURES` and `VHOST_USER_SET_PROTOCOL_FEATURES` even
+            // before acknowledging the feature, so we don't need to call `set_features()` yet
+            // (and doing so before driver feature negotiation may confuse some backends),
+            // but add it to `acked_features` so it will be included in any future
+            // `set_features()` calls.
             acked_features |= 1 << VHOST_USER_F_PROTOCOL_FEATURES;
 
             let avail_protocol_features = backend_client
@@ -243,11 +216,11 @@ impl VhostUserFrontend {
             backend_client: Arc::new(Mutex::new(backend_client)),
             avail_features,
             acked_features,
+            sent_set_features: false,
             protocol_features,
             backend_req_handler,
             shmem_region: RefCell::new(None),
             queue_sizes,
-            cfg: cfg.map(|cfg| cfg.to_vec()),
             expose_shmem_descriptors_with_viommu,
             pci_address,
             sent_queues: None,
@@ -414,14 +387,10 @@ impl VirtioDevice for VhostUserFrontend {
             return;
         }
         self.acked_features = features;
+        self.sent_set_features = true;
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        if let Some(cfg) = &self.cfg {
-            copy_config(data, 0, cfg, offset);
-            return;
-        }
-
         let Ok(offset) = offset.try_into() else {
             error!("failed to read config: invalid config offset is given: {offset}");
             return;
@@ -469,6 +438,11 @@ impl VirtioDevice for VhostUserFrontend {
         interrupt: Interrupt,
         queues: BTreeMap<usize, Queue>,
     ) -> anyhow::Result<()> {
+        // Ensure at least one `VHOST_USER_SET_FEATURES` is sent before activation.
+        if !self.sent_set_features {
+            self.ack_features(self.acked_features);
+        }
+
         self.set_mem_table(&mem)?;
 
         let msix_config_opt = interrupt
@@ -505,6 +479,8 @@ impl VirtioDevice for VhostUserFrontend {
         if let Some(w) = self.worker_thread.take() {
             self.backend_req_handler = w.stop();
         }
+
+        self.sent_set_features = false;
 
         Ok(())
     }
@@ -651,6 +627,11 @@ impl VirtioDevice for VhostUserFrontend {
     }
 
     fn virtio_restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
+        // Ensure features are negotiated before restoring.
+        if !self.sent_set_features {
+            self.ack_features(self.acked_features);
+        }
+
         if !self
             .protocol_features
             .contains(VhostUserProtocolFeatures::DEVICE_STATE)

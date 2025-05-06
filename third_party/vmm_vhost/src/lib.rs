@@ -85,9 +85,9 @@ pub enum Error {
     /// Virtio/protocol features mismatch.
     #[error("virtio features mismatch")]
     FeatureMismatch,
-    /// Failure from the frontend server side.
-    #[error("frontend server internal error")]
-    FrontendServerInternalError,
+    /// Failure from the frontend side.
+    #[error("frontend Internal error")]
+    FrontendInternalError,
     /// Fd array in question is too big or too small
     #[error("wrong number of attached fds")]
     IncorrectFds,
@@ -119,7 +119,7 @@ pub enum Error {
     },
     /// Error from request handler
     #[error("handler failed to handle request: {0}")]
-    ReqHandlerError(#[source] anyhow::Error),
+    ReqHandlerError(#[source] IOError),
     /// Failure to restore.
     #[error("Failed to restore")]
     RestoreError(anyhow::Error),
@@ -220,6 +220,9 @@ impl From<base::Error> for Error {
 
 /// Result of vhost-user operations
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Result of request handler.
+pub type HandlerResult<T> = std::result::Result<T, IOError>;
 
 /// Utility function to convert a vector of files into a single file.
 /// Returns `None` if the vector contains no files or more than one file.
