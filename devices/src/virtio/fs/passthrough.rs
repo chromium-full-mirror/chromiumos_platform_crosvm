@@ -47,6 +47,7 @@ use base::unix::FileFlags;
 use base::warn;
 use base::AsRawDescriptor;
 use base::FromRawDescriptor;
+use base::IntoRawDescriptor;
 use base::IoctlNr;
 use base::Protection;
 use base::RawDescriptor;
@@ -258,27 +259,41 @@ impl From<libc::mode_t> for FileType {
 
 #[derive(Debug)]
 struct OpenedFile {
-    file: File,
+    file: Option<File>,
     open_flags: libc::c_int,
 }
 
 impl AsRawDescriptor for OpenedFile {
     fn as_raw_descriptor(&self) -> RawDescriptor {
-        self.file.as_raw_descriptor()
+        self.file().as_raw_descriptor()
     }
 }
 
 impl OpenedFile {
     fn new(file: File, open_flags: libc::c_int) -> Self {
-        OpenedFile { file, open_flags }
+        OpenedFile {
+            file: Some(file),
+            open_flags,
+        }
     }
 
     fn file(&self) -> &File {
-        &self.file
+        self.file.as_ref().expect("must have a file")
     }
 
     fn file_mut(&mut self) -> &mut File {
-        &mut self.file
+        self.file.as_mut().expect("must have a file")
+    }
+
+    /// Leaks the file descriptor and makes the struct unusable.
+    ///
+    /// This is an optimization to speed up dropping `OpenedFile` instances, which is useful
+    /// during an abrupt shutdown. Instead of properly closing the file descriptor, which
+    /// involves a syscall, this function effectively forgets the file descriptor, relying on the
+    /// OS to clean it up when the process terminates.
+    fn leak_fd(&mut self) {
+        let f = self.file.take().expect("must have a file");
+        let _ = f.into_raw_descriptor();
     }
 }
 
@@ -290,6 +305,8 @@ struct InodeData {
     refcount: AtomicU64,
     filetype: FileType,
     path: String,
+    // This needs to be atomic because we need to set it through a shared reference.
+    unsafe_leak_fd: AtomicBool,
 }
 
 impl AsRawDescriptor for InodeData {
@@ -298,15 +315,55 @@ impl AsRawDescriptor for InodeData {
     }
 }
 
+impl Drop for InodeData {
+    /// If `unsafe_leak_fd` is set, this `drop` implementation will "leak" the file descriptor.
+    /// This is an optimization to speed up the cleanup process, based on the
+    /// assumption that the OS will handle the cleanup of file descriptors after the process
+    /// terminates. This is only okay if the process is guaranteed to terminate immediately
+    /// after the `PassthroughFs` instance is dropped.
+    fn drop(&mut self) {
+        if self.unsafe_leak_fd.load(Ordering::Relaxed) {
+            self.file.get_mut().leak_fd();
+        }
+    }
+}
+
+impl InodeData {
+    fn set_unsafe_leak_fd(&self) {
+        self.unsafe_leak_fd.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 struct HandleData {
     inode: Inode,
-    file: Mutex<File>,
+    file: Mutex<OpenedFile>,
+
+    unsafe_leak_fd: AtomicBool,
 }
 
 impl AsRawDescriptor for HandleData {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.file.lock().as_raw_descriptor()
+    }
+}
+
+impl Drop for HandleData {
+    /// If `unsafe_leak_fd` is set, this `drop` implementation will "leak" the file descriptor by
+    /// forgetting it. This is an optimization to speed up the cleanup process, based on the
+    /// assumption that the OS will handle the cleanup of file descriptors after the process
+    // terminates. This is only safe if the process is guaranteed to terminate immediately
+    /// after the `PassthroughFs` instance is dropped.
+    fn drop(&mut self) {
+        if self.unsafe_leak_fd.load(Ordering::Relaxed) {
+            self.file.get_mut().leak_fd();
+        }
+    }
+}
+
+impl HandleData {
+    fn set_unsafe_leak_fd(&self) {
+        self.unsafe_leak_fd.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1037,6 +1094,7 @@ impl PassthroughFs {
                     refcount: AtomicU64::new(1),
                     filetype: st.st_mode.into(),
                     path,
+                    unsafe_leak_fd: AtomicBool::new(false),
                 }),
             );
 
@@ -1211,10 +1269,14 @@ impl PassthroughFs {
     fn do_open(&self, inode: Inode, flags: u32) -> io::Result<(Option<Handle>, OpenOptions)> {
         let inode_data = self.find_inode(inode)?;
 
-        let file = Mutex::new(self.open_inode(&inode_data, flags as i32)?);
+        let file = self.open_inode(&inode_data, flags as i32)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let data = HandleData { inode, file };
+        let data = HandleData {
+            inode,
+            file: Mutex::new(OpenedFile::new(file, flags as i32)),
+            unsafe_leak_fd: AtomicBool::new(false),
+        };
 
         self.handles.lock().insert(handle, Arc::new(data));
 
@@ -1248,7 +1310,8 @@ impl PassthroughFs {
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
             inode,
-            file: Mutex::new(file_open),
+            file: Mutex::new(OpenedFile::new(file_open, open_flags)),
+            unsafe_leak_fd: AtomicBool::new(false),
         };
 
         self.handles.lock().insert(handle, Arc::new(data));
@@ -1649,7 +1712,10 @@ impl PassthroughFs {
                 match flags {
                     FileFlags::ReadWrite | FileFlags::Write => {
                         // We need to get a read-only handle for this file.
-                        *file = self.open_fd(file.as_raw_descriptor(), libc::O_RDONLY)?;
+                        *file = OpenedFile::new(
+                            self.open_fd(file.as_raw_descriptor(), libc::O_RDONLY)?,
+                            libc::O_RDONLY,
+                        );
                     }
                     FileFlags::Read => {}
                 }
@@ -2176,19 +2242,21 @@ fn strip_xattr_prefix(buf: &mut Vec<u8>) {
 }
 
 impl Drop for PassthroughFs {
+    /// The `Drop` implementation for this struct intentionally leaks all open file descriptors.
+    /// It sets the `unsafe_leak_fd` flag on all `InodeData` and `HandleData` instances, which
+    /// causes their `drop` implementations to forget the underlying `File` objects.
+    ///
+    /// This is a deliberate performance optimization for abrupt shutdowns. It relies on the
+    /// operating system to clean up the file descriptors when the process terminates. It is
+    /// **critical** that an instance of `PassthroughFs` is only dropped immediately prior to
+    /// process termination.
     fn drop(&mut self) {
-        // When PassthroughFs is dropped, its process is usually terminated.
-        // In that case, we don't need to close all file descriptors inside `inodes` and `handles`
-        // gracefully. Instead, we can just forget them and let the OS clean them up, which
-        // is much faster.
-        //
-        // Note that this optimization makes sense only when the guest stops unexpectedly, because
-        // during a graceful shutdown, the virtio-fs driver cleans up the file system with the
-        // `destroy` command so `inodes` and `handles` are empty here.
-        let mut inodes = self.inodes.lock();
-        std::mem::forget(std::mem::take(&mut *inodes));
-        let mut handles = self.handles.lock();
-        std::mem::forget(std::mem::take(&mut *handles));
+        let inodes = self.inodes.lock();
+        inodes.apply(|v| {
+            v.set_unsafe_leak_fd();
+        });
+        let handles = self.handles.lock();
+        handles.values().for_each(|v| v.set_unsafe_leak_fd());
     }
 }
 
@@ -2233,6 +2301,7 @@ impl FileSystem for PassthroughFs {
                 refcount: AtomicU64::new(2),
                 filetype: st.st_mode.into(),
                 path: "".to_string(),
+                unsafe_leak_fd: AtomicBool::new(false),
             }),
         );
 
@@ -2672,7 +2741,7 @@ impl FileSystem for PassthroughFs {
             let data = self.find_handle(handle, inode)?;
 
             let mut f = data.file.lock();
-            w.write_from(&mut f, size as usize, offset)
+            w.write_from(f.file_mut(), size as usize, offset)
         }
     }
 
@@ -2730,7 +2799,7 @@ impl FileSystem for PassthroughFs {
             let data = self.find_handle(handle, inode)?;
 
             let mut f = data.file.lock();
-            r.read_to(&mut f, size as usize, offset)
+            r.read_to(f.file_mut(), size as usize, offset)
         }
     }
 
@@ -2758,7 +2827,7 @@ impl FileSystem for PassthroughFs {
         let inode_data = self.find_inode(inode)?;
 
         enum Data<'a> {
-            Handle(MutexGuard<'a, File>),
+            Handle(MutexGuard<'a, OpenedFile>),
             ProcPath(CString),
         }
 
