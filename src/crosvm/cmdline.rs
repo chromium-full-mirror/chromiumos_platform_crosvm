@@ -61,14 +61,13 @@ use devices::StubPciParameters;
 use hypervisor::CpuHybridType;
 use hypervisor::ProtectionType;
 use resources::AddressRange;
+#[cfg(feature = "gpu")]
 use serde::Deserialize;
 #[cfg(feature = "gpu")]
 use serde_keyvalue::FromKeyValues;
 use vm_memory::FileBackedMappingParameters;
 
 use super::config::PmemOption;
-#[cfg(feature = "gpu")]
-use super::gpu_config::fixup_gpu_display_options;
 #[cfg(feature = "gpu")]
 use super::gpu_config::fixup_gpu_options;
 #[cfg(all(unix, feature = "gpu"))]
@@ -78,7 +77,7 @@ use crate::crosvm::config::parse_bus_id_addr;
 use crate::crosvm::config::parse_cpu_affinity;
 use crate::crosvm::config::parse_cpu_btreemap_u32;
 #[cfg(all(
-    any(target_arch = "arm", target_arch = "aarch64"),
+    target_arch = "aarch64",
     any(target_os = "android", target_os = "linux")
 ))]
 use crate::crosvm::config::parse_cpu_frequencies;
@@ -793,24 +792,6 @@ impl TryFrom<GpuParameters> for FixedGpuParameters {
     }
 }
 
-/// Container for `GpuDisplayParameters` that have been fixed after parsing using serde.
-///
-/// This deserializes as a regular `GpuDisplayParameters` and applies validation.
-/// TODO(b/260101753): Remove this once the old syntax for specifying DPI is deprecated.
-#[cfg(feature = "gpu")]
-#[derive(Debug, Deserialize, FromKeyValues)]
-#[serde(try_from = "GpuDisplayParameters")]
-pub struct FixedGpuDisplayParameters(pub GpuDisplayParameters);
-
-#[cfg(feature = "gpu")]
-impl TryFrom<GpuDisplayParameters> for FixedGpuDisplayParameters {
-    type Error = String;
-
-    fn try_from(gpu_display_params: GpuDisplayParameters) -> Result<Self, Self::Error> {
-        fixup_gpu_display_options(gpu_display_params)
-    }
-}
-
 /// User-specified configuration for the `crosvm run` command.
 #[remain::sorted]
 #[argh_helpers::pad_description_for_argh]
@@ -983,7 +964,7 @@ pub struct RunCommand {
     pub cpu_cluster: Vec<CpuSet>,
 
     #[cfg(all(
-        any(target_arch = "arm", target_arch = "aarch64"),
+        target_arch = "aarch64",
         any(target_os = "android", target_os = "linux")
     ))]
     #[argh(
@@ -999,7 +980,7 @@ pub struct RunCommand {
     pub cpu_frequencies_khz: Option<BTreeMap<usize, Vec<u32>>>, // CPU index -> frequencies
 
     #[cfg(all(
-        any(target_arch = "arm", target_arch = "aarch64"),
+        target_arch = "aarch64",
         any(target_os = "android", target_os = "linux")
     ))]
     #[argh(
@@ -1284,7 +1265,7 @@ pub struct RunCommand {
     /// (EXPERIMENTAL) Comma separated key=value pairs for setting
     /// up a display on the virtio-gpu device. See comments for `gpu`
     /// for possible key values of GpuDisplayParameters.
-    pub gpu_display: Vec<FixedGpuDisplayParameters>,
+    pub gpu_display: Vec<GpuDisplayParameters>,
 
     #[cfg(all(unix, feature = "gpu"))]
     #[argh(option)]
@@ -2121,7 +2102,7 @@ pub struct RunCommand {
     pub vhost_net_device: Option<PathBuf>,
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     #[argh(switch)]
     /// use vhost for scmi
     pub vhost_scmi: Option<bool>,
@@ -2169,7 +2150,7 @@ pub struct RunCommand {
     pub video_encoder: Vec<VideoDeviceConfig>,
 
     #[cfg(all(
-        any(target_arch = "arm", target_arch = "aarch64"),
+        target_arch = "aarch64",
         any(target_os = "android", target_os = "linux")
     ))]
     #[argh(switch)]
@@ -2177,7 +2158,7 @@ pub struct RunCommand {
     pub virt_cpufreq: Option<bool>,
 
     #[cfg(all(
-        any(target_arch = "arm", target_arch = "aarch64"),
+        target_arch = "aarch64",
         any(target_os = "android", target_os = "linux")
     ))]
     #[argh(switch)]
@@ -2321,7 +2302,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     }
                 }
             }
-            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            #[cfg(target_arch = "aarch64")]
             {
                 cfg.sve = cpus.sve;
             }
@@ -2338,7 +2319,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         #[cfg(all(
-            any(target_arch = "arm", target_arch = "aarch64"),
+            target_arch = "aarch64",
             any(target_os = "android", target_os = "linux")
         ))]
         {
@@ -2660,7 +2641,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
-        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        #[cfg(target_arch = "aarch64")]
         {
             cfg.vhost_scmi = cmd.vhost_scmi.unwrap_or_default();
         }
@@ -2834,7 +2815,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                 cfg.gpu_parameters
                     .get_or_insert_with(Default::default)
                     .display_params
-                    .extend(cmd.gpu_display.into_iter().map(|p| p.0));
+                    .extend(cmd.gpu_display);
             }
 
             #[cfg(feature = "android_display")]
