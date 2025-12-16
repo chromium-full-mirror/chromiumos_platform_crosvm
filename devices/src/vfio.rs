@@ -14,6 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(all(target_os = "android", target_arch = "aarch64"))]
 use std::ptr::addr_of_mut;
+use std::result;
 use std::slice;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -37,7 +38,6 @@ use data_model::vec_with_array_field;
 use hypervisor::DeviceKind;
 use hypervisor::Vm;
 use rand::seq::index::sample;
-use rand::thread_rng;
 use remain::sorted;
 use resources::address_allocator::AddressAllocator;
 use resources::AddressRange;
@@ -1044,7 +1044,7 @@ impl VfioDevice {
 
             let vsids_len = KvmVfioPviommu::get_sid_count(vm, &dev)?.try_into().unwrap();
             let max_vsid = u32::MAX.try_into().unwrap();
-            let random_vsids = sample(&mut thread_rng(), max_vsid, vsids_len).into_iter();
+            let random_vsids = sample(&mut rand::thread_rng(), max_vsid, vsids_len).into_iter();
             let vsids = Vec::from_iter(random_vsids.map(|v| u32::try_from(v).unwrap()));
             for (i, vsid) in vsids.iter().enumerate() {
                 pviommu.attach(&dev, i.try_into().unwrap(), *vsid)?;
@@ -1163,17 +1163,8 @@ impl VfioDevice {
 
     /// enter the device's low power state
     pub fn pm_low_power_enter(&self) -> Result<()> {
-        let mut device_feature = vec_with_array_field::<vfio_device_feature, u8>(0);
-        device_feature[0].argsz = mem::size_of::<vfio_device_feature>() as u32;
-        device_feature[0].flags = VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_LOW_POWER_ENTRY;
-        // SAFETY:
-        // Safe as we are the owner of self and power_management which are valid value
-        let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_FEATURE, &device_feature[0]) };
-        if ret < 0 {
-            Err(VfioError::VfioPmLowPowerEnter(get_error()))
-        } else {
-            Ok(())
-        }
+        self.device_feature(VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_LOW_POWER_ENTRY)
+            .map_err(VfioError::VfioPmLowPowerEnter)
     }
 
     /// enter the device's low power state with wakeup notification
@@ -1210,14 +1201,19 @@ impl VfioDevice {
 
     /// exit the device's low power state
     pub fn pm_low_power_exit(&self) -> Result<()> {
+        self.device_feature(VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_LOW_POWER_EXIT)
+            .map_err(VfioError::VfioPmLowPowerExit)
+    }
+
+    fn device_feature(&self, flags: u32) -> result::Result<(), Error> {
         let mut device_feature = vec_with_array_field::<vfio_device_feature, u8>(0);
         device_feature[0].argsz = mem::size_of::<vfio_device_feature>() as u32;
-        device_feature[0].flags = VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_LOW_POWER_EXIT;
+        device_feature[0].flags = flags;
         // SAFETY:
-        // Safe as we are the owner of self and power_management which are valid value
+        // Safe as we are the owner of self and device_feature which are valid value
         let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_FEATURE, &device_feature[0]) };
         if ret < 0 {
-            Err(VfioError::VfioPmLowPowerExit(get_error()))
+            Err(get_error())
         } else {
             Ok(())
         }
