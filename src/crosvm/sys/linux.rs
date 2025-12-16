@@ -216,7 +216,7 @@ const GENIEZONE_PATH: &str = "/dev/gzvm";
 static GUNYAH_PATH: &str = "/dev/gunyah";
 #[cfg(target_arch = "aarch64")]
 #[cfg(feature = "halla")]
-const HALLA_PATH: &str = "/dev/hvm";
+const HALLA_PATH: &str = "/dev/halla";
 
 fn create_virtio_devices(
     cfg: &Config,
@@ -451,7 +451,7 @@ fn create_virtio_devices(
     }
 
     if cfg.rng {
-        devs.push(create_rng_device(
+        devs.push(create_virtio_rng_device(
             cfg.protection_type,
             cfg.jail_config.as_ref(),
         )?);
