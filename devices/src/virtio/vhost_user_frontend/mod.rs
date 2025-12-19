@@ -143,7 +143,7 @@ impl VhostUserFrontend {
         // VHOST_USER_PROTOCOL_FEATURE_SHARED_MEMORY_REGIONS. This should either be standardized
         // (and enabled for all device types) or removed.
         let expose_shmem_descriptors_with_viommu = if device_type == DeviceType::Gpu {
-            allow_protocol_features |= VhostUserProtocolFeatures::SHARED_MEMORY_REGIONS;
+            allow_protocol_features |= VhostUserProtocolFeatures::SHMEM_MAP;
             true
         } else {
             false
@@ -514,39 +514,38 @@ impl VirtioDevice for VhostUserFrontend {
     fn get_shared_memory_region(&self) -> Option<SharedMemoryRegion> {
         if !self
             .protocol_features
-            .contains(VhostUserProtocolFeatures::SHARED_MEMORY_REGIONS)
+            .contains(VhostUserProtocolFeatures::SHMEM_MAP)
         {
             return None;
         }
         if let Some(r) = self.shmem_region.borrow().as_ref() {
             return r.clone();
         }
-        let regions = match self
+        let (config_hdr, sizes) = match self
             .backend_client
-            .get_shared_memory_regions()
+            .get_shmem_config()
             .map_err(Error::ShmemRegions)
         {
             Ok(x) => x,
             Err(e) => {
-                error!("Failed to get shared memory regions {}", e);
+                error!("Failed to get shared memory config {}", e);
                 return None;
             }
         };
-        let region = match regions.len() {
+        let region = match config_hdr.nregions {
             0 => None,
             1 => Some(SharedMemoryRegion {
-                id: regions[0].id,
-                length: regions[0].length,
+                id: 0,
+                length: sizes[0],
             }),
             n => {
                 error!(
-                    "Failed to get shared memory regions {}",
-                    Error::TooManyShmemRegions(n)
+                    "Failed to get shared memory region {}",
+                    Error::TooManyShmemRegions(n as usize)
                 );
                 return None;
             }
         };
-
         *self.shmem_region.borrow_mut() = Some(region.clone());
         region
     }
