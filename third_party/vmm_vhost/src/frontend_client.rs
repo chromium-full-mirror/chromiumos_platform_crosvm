@@ -60,6 +60,9 @@ impl FrontendClient {
         let code = hdr.get_code().map_err(|_| Error::InvalidMessage)?;
         if code != BackendReq::GPU_MAP
             && code != BackendReq::EXTERNAL_MAP
+            // TODO(fmayle): Remove SHMEM cases once REPLY_ACK negotiation is supported.
+            && code != BackendReq::SHMEM_MAP
+            && code != BackendReq::SHMEM_UNMAP
             && !self.reply_ack_negotiated
         {
             return Ok(0);
@@ -88,16 +91,12 @@ impl FrontendClient {
 
 impl Frontend for FrontendClient {
     /// Handle shared memory region mapping requests.
-    fn shmem_map(
-        &mut self,
-        req: &VhostUserShmemMapMsg,
-        fd: &dyn AsRawDescriptor,
-    ) -> HandlerResult<u64> {
+    fn shmem_map(&mut self, req: &VhostUserMMap, fd: &dyn AsRawDescriptor) -> HandlerResult<u64> {
         self.send_message(BackendReq::SHMEM_MAP, req, Some(&[fd.as_raw_descriptor()]))
     }
 
     /// Handle shared memory region unmapping requests.
-    fn shmem_unmap(&mut self, req: &VhostUserShmemUnmapMsg) -> HandlerResult<u64> {
+    fn shmem_unmap(&mut self, req: &VhostUserMMap) -> HandlerResult<u64> {
         self.send_message(BackendReq::SHMEM_UNMAP, req, None)
     }
 

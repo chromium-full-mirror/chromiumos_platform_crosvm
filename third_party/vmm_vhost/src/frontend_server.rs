@@ -24,16 +24,12 @@ pub trait Frontend {
     }
 
     /// Handle shared memory region mapping requests.
-    fn shmem_map(
-        &mut self,
-        _req: &VhostUserShmemMapMsg,
-        _fd: &dyn AsRawDescriptor,
-    ) -> HandlerResult<u64> {
+    fn shmem_map(&mut self, _req: &VhostUserMMap, _fd: &dyn AsRawDescriptor) -> HandlerResult<u64> {
         Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
     /// Handle shared memory region unmapping requests.
-    fn shmem_unmap(&mut self, _req: &VhostUserShmemUnmapMsg) -> HandlerResult<u64> {
+    fn shmem_unmap(&mut self, _req: &VhostUserMMap) -> HandlerResult<u64> {
         Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -123,14 +119,14 @@ impl<S: Frontend> FrontendServer<S> {
                     .map_err(Error::ReqHandlerError)
             }
             Ok(BackendReq::SHMEM_MAP) => {
-                let msg = self.extract_msg_body::<VhostUserShmemMapMsg>(&hdr, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserMMap>(&hdr, &buf)?;
                 // check_attached_files() has validated files
                 self.frontend
                     .shmem_map(&msg, &files[0])
                     .map_err(Error::ReqHandlerError)
             }
             Ok(BackendReq::SHMEM_UNMAP) => {
-                let msg = self.extract_msg_body::<VhostUserShmemUnmapMsg>(&hdr, &buf)?;
+                let msg = self.extract_msg_body::<VhostUserMMap>(&hdr, &buf)?;
                 self.frontend
                     .shmem_unmap(&msg)
                     .map_err(Error::ReqHandlerError)
@@ -213,6 +209,9 @@ impl<S: Frontend> FrontendServer<S> {
         let code = req.get_code().map_err(|_| Error::InvalidMessage)?;
         if code == BackendReq::GPU_MAP
             || code == BackendReq::EXTERNAL_MAP
+            // TODO(fmayle): Remove SHMEM cases once REPLY_ACK negotiation is supported.
+            || code == BackendReq::SHMEM_MAP
+            || code == BackendReq::SHMEM_UNMAP
             || (self.reply_ack_negotiated && req.is_need_reply())
         {
             let hdr = self.new_reply_header::<VhostUserU64>(req)?;

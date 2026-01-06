@@ -11,8 +11,8 @@ use hypervisor::MemCacheType;
 use vm_control::VmMemorySource;
 use vmm_vhost::message::VhostUserExternalMapMsg;
 use vmm_vhost::message::VhostUserGpuMapMsg;
-use vmm_vhost::message::VhostUserShmemMapMsg;
-use vmm_vhost::message::VhostUserShmemUnmapMsg;
+use vmm_vhost::message::VhostUserMMap;
+use vmm_vhost::message::VhostUserMMapFlags;
 use vmm_vhost::Frontend;
 use vmm_vhost::FrontendServer;
 use vmm_vhost::HandlerResult;
@@ -54,11 +54,7 @@ impl BackendReqHandlerImpl {
 }
 
 impl Frontend for BackendReqHandlerImpl {
-    fn shmem_map(
-        &mut self,
-        req: &VhostUserShmemMapMsg,
-        fd: &dyn AsRawDescriptor,
-    ) -> HandlerResult<u64> {
+    fn shmem_map(&mut self, req: &VhostUserMMap, fd: &dyn AsRawDescriptor) -> HandlerResult<u64> {
         let shared_mapper_state = self
             .shared_mapper_state
             .as_mut()
@@ -78,7 +74,11 @@ impl Frontend for BackendReqHandlerImpl {
                 size: req.len,
             },
             req.shm_offset,
-            Protection::from(req.flags),
+            if req.flags.contains(VhostUserMMapFlags::MAP_RW) {
+                Protection::read_write()
+            } else {
+                Protection::read()
+            },
             MemCacheType::CacheCoherent,
         ) {
             Ok(()) => Ok(0),
@@ -89,7 +89,7 @@ impl Frontend for BackendReqHandlerImpl {
         }
     }
 
-    fn shmem_unmap(&mut self, req: &VhostUserShmemUnmapMsg) -> HandlerResult<u64> {
+    fn shmem_unmap(&mut self, req: &VhostUserMMap) -> HandlerResult<u64> {
         let shared_mapper_state = self
             .shared_mapper_state
             .as_mut()
