@@ -19,6 +19,7 @@ use crate::Connection;
 use crate::Error;
 use crate::FrontendReq;
 use crate::Result;
+use crate::SharedMemoryRegion;
 
 /// Trait for vhost-user backends.
 ///
@@ -75,7 +76,7 @@ pub trait Backend {
         fd: File,
     ) -> Result<Option<File>>;
     fn check_device_state(&mut self) -> Result<()>;
-    fn get_shmem_config(&mut self) -> Result<Vec<u64>>;
+    fn get_shmem_config(&mut self) -> Result<Vec<SharedMemoryRegion>>;
 }
 
 impl<T> Backend for T
@@ -209,7 +210,7 @@ where
         self.as_mut().check_device_state()
     }
 
-    fn get_shmem_config(&mut self) -> Result<Vec<u64>> {
+    fn get_shmem_config(&mut self) -> Result<Vec<SharedMemoryRegion>> {
         self.as_mut().get_shmem_config()
     }
 }
@@ -656,9 +657,8 @@ impl<S: Backend> BackendServer<S> {
                 res?;
             }
             Ok(FrontendReq::GET_SHMEM_CONFIG) => {
-                let sizes = self.backend.get_shmem_config()?;
-                let msg = VhostUserShMemConfigHeader::new(sizes.len().try_into().unwrap());
-                self.send_reply_with_payload(&hdr, &msg, sizes.as_slice().as_bytes())?;
+                let msg = VhostUserShMemConfig::new(&self.backend.get_shmem_config()?);
+                self.send_reply_message(&hdr, &msg)?;
             }
             _ => {
                 return Err(Error::InvalidMessage);

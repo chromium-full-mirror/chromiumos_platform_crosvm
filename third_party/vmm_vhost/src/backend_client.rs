@@ -23,16 +23,28 @@ use crate::Error as VhostUserError;
 use crate::FrontendReq;
 use crate::Result as VhostUserResult;
 use crate::Result;
+use crate::SharedMemoryRegion;
 
 /// Client for a vhost-user device. The API is a thin abstraction over the vhost-user protocol.
 pub struct BackendClient {
     connection: Connection<FrontendReq>,
+    set_need_reply: bool,
 }
 
 impl BackendClient {
     /// Create a new instance.
     pub fn new(connection: Connection<FrontendReq>) -> Self {
-        BackendClient { connection }
+        BackendClient {
+            connection,
+            set_need_reply: false,
+        }
+    }
+
+    /// Whether to set the "need_reply" flag in the message header for every request message.
+    ///
+    /// Requires the `VHOST_USER_PROTOCOL_F_REPLY_ACK` protocol feature to have been negotiated.
+    pub fn set_need_reply(&mut self, enable: bool) {
+        self.set_need_reply = enable;
     }
 
     /// Get a bitmask of supported virtio/vhost features.
@@ -368,16 +380,23 @@ impl BackendClient {
     }
 
     /// Get the shared memory configuration.
-    pub fn get_shmem_config(&self) -> Result<Vec<u64>> {
+    pub fn get_shmem_config(&self) -> Result<Vec<SharedMemoryRegion>> {
         let hdr = self.send_request_header(FrontendReq::GET_SHMEM_CONFIG, None)?;
-        let (body_reply, buf_reply, _rfds) =
-            self.recv_reply_with_payload::<VhostUserShMemConfigHeader>(&hdr)?;
-        let memory_sizes = <[u64]>::ref_from_bytes_with_elems(
-            buf_reply.as_slice(),
-            body_reply.nregions.try_into().unwrap(),
-        )
-        .map_err(|_| VhostUserError::InvalidMessage)?;
-        Ok(memory_sizes.to_vec())
+        let reply: VhostUserShMemConfig = self.recv_reply(&hdr)?;
+
+        let shared_memory_regions = reply
+            .sizes
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, n)| n != 0)
+            .take(reply.nregions.try_into().unwrap())
+            .map(|(id, length)| SharedMemoryRegion {
+                id: id as u8,
+                length,
+            })
+            .collect();
+
+        Ok(shared_memory_regions)
     }
 
     fn send_request_header(
@@ -515,7 +534,7 @@ impl BackendClient {
         request: FrontendReq,
         size: u32,
     ) -> VhostUserMsgHeader<FrontendReq> {
-        VhostUserMsgHeader::new_request_header(request, size, false)
+        VhostUserMsgHeader::new_request_header(request, size, self.set_need_reply)
     }
 }
 

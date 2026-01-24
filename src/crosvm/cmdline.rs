@@ -21,6 +21,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use arch::CpuSet;
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+use arch::DevicePowerManagerConfig;
 use arch::FdtPosition;
 #[cfg(all(target_os = "android", target_arch = "aarch64"))]
 use arch::FfaConfig;
@@ -1050,6 +1052,12 @@ pub struct RunCommand {
     #[argh(switch)]
     /// don't set VCPUs real-time until make-rt command is run
     pub delay_rt: Option<bool>,
+
+    // Currently, only pKVM is supported so limit this option to Android kernel.
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    #[argh(option)]
+    /// selects the interface for guest-controlled power management of assigned devices.
+    pub dev_pm: Option<DevicePowerManagerConfig>,
 
     #[argh(option, arg_name = "PATH[,filter]")]
     /// path to device tree overlay binary which will be applied to the base guest device tree
@@ -2099,6 +2107,15 @@ pub struct RunCommand {
     /// path to sysfs of platform pass through
     pub vfio_platform: Vec<VfioOption>,
 
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "android", target_os = "linux")
+    ))]
+    #[argh(switch)]
+    /// expose the LOW_POWER_ENTRY/EXIT feature of VFIO platform devices to guests, if available
+    /// (EXPERIMENTAL) The host kernel may not support the API used by CrosVM
+    pub vfio_platform_pm: Option<bool>,
+
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(switch)]
     /// (DEPRECATED): Use --net.
@@ -2333,6 +2350,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         ))]
         {
             cfg.smccc_trng = cmd.smccc_trng.unwrap_or_default();
+            cfg.vfio_platform_pm = cmd.vfio_platform_pm.unwrap_or_default();
             cfg.virt_cpufreq = cmd.virt_cpufreq.unwrap_or_default();
             cfg.virt_cpufreq_v2 = cmd.virt_cpufreq_upstream.unwrap_or_default();
             if cfg.virt_cpufreq && cfg.virt_cpufreq_v2 {
@@ -2379,6 +2397,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         #[cfg(all(target_os = "android", target_arch = "aarch64"))]
         {
             cfg.ffa = cmd.ffa;
+            cfg.dev_pm = cmd.dev_pm;
         }
 
         cfg.hugepages = cmd.hugepages.unwrap_or_default();

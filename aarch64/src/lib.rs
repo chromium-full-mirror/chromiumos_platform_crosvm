@@ -18,6 +18,7 @@ use std::sync::Arc;
 use aarch64_sys_reg::AArch64SysRegId;
 use arch::get_serial_cmdline;
 use arch::CpuSet;
+use arch::DevicePowerManagerConfig;
 use arch::DtbOverlay;
 use arch::FdtPosition;
 use arch::GetSerialCmdlineError;
@@ -37,6 +38,8 @@ use devices::Bus;
 use devices::BusDeviceObj;
 use devices::BusError;
 use devices::BusType;
+use devices::DevicePowerManager;
+use devices::HvcDevicePowerManager;
 use devices::IrqChip;
 use devices::IrqChipAArch64;
 use devices::IrqEventSource;
@@ -311,6 +314,8 @@ pub enum Error {
     LoadElfKernel(kernel_loader::Error),
     #[error("failed to map arm pvtime memory: {0}")]
     MapPvtimeError(base::Error),
+    #[error("missing power manager for assigned devices")]
+    MissingDevicePowerManager,
     #[error("pVM firmware could not be loaded: {0}")]
     PvmFwLoadFailure(base::Error),
     #[error("ramoops address is different from high_mmio_base: {0} vs {1}")]
@@ -764,6 +769,8 @@ impl arch::LinuxArch for AArch64 {
             .into_iter()
             .map(|(dev, jail_orig)| (*(dev.into_platform_device().unwrap()), jail_orig))
             .collect();
+        // vfio-platform is currently the only backend for PM of platform devices.
+        let mut dev_pm = components.vfio_platform_pm.then(DevicePowerManager::new);
         let (platform_devices, mut platform_pid_debug_label_map, dev_resources) =
             arch::sys::linux::generate_platform_bus(
                 platform_devices,
@@ -773,6 +780,7 @@ impl arch::LinuxArch for AArch64 {
                 &mut vm,
                 #[cfg(feature = "swap")]
                 swap_controller,
+                &mut dev_pm,
                 components.hv_cfg.protection_type,
             )
             .map_err(Error::CreatePlatformBus)?;
@@ -788,6 +796,21 @@ impl arch::LinuxArch for AArch64 {
                     .map_err(|e| Error::RegisterHypercalls(base, count, e))?;
                 vm.enable_hypercalls(base, count)
                     .map_err(|e| Error::EnableHypercalls(base, count, e))?;
+            }
+        }
+
+        if let Some(config) = components.dev_pm {
+            let dev_pm = dev_pm.ok_or(Error::MissingDevicePowerManager)?;
+            match config {
+                DevicePowerManagerConfig::PkvmHvc => {
+                    let hvc_pm_dev = HvcDevicePowerManager::new(dev_pm);
+                    let hvc_id = HvcDevicePowerManager::HVC_FUNCTION_ID.into();
+                    hypercall_bus
+                        .insert_sync(Arc::new(hvc_pm_dev), hvc_id, 1)
+                        .map_err(|e| Error::RegisterHypercalls(hvc_id, 1, e))?;
+                    vm.enable_hypercall(hvc_id)
+                        .map_err(|e| Error::EnableHypercalls(hvc_id, 1, e))?;
+                }
             }
         }
 
