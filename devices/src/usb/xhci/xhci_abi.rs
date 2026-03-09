@@ -65,7 +65,7 @@ pub enum TrbType {
 /// Completion code of trb types.
 #[bitfield]
 #[bits = 8]
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum TrbCompletionCode {
     Success = 1,
     TransactionError = 4,
@@ -914,6 +914,11 @@ impl TransferDescriptor {
     /// Return the first TRB.
     pub fn first_atrb(&self) -> &AddressedTrb {
         self.first().expect("TransferDescriptor must be non-empty")
+    }
+
+    /// Return the last TRB.
+    pub fn last_atrb(&self) -> &AddressedTrb {
+        self.last().expect("TransferDescriptor must be non-empty")
     }
 }
 
