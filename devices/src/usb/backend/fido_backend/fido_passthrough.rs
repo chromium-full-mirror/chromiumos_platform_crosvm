@@ -383,9 +383,11 @@ impl BackendDevice for FidoPassthroughDevice {
         Ok(BackendTransferHandle::new(cancel_handle))
     }
 
-    fn detach_event_handler(&self, _event_loop: &Arc<EventLoop>) -> BackendResult<()> {
+    fn detach_event_handler(&self, event_loop: &Arc<EventLoop>) -> BackendResult<()> {
         self.device.lock().set_active(false);
-        Ok(())
+        event_loop
+            .remove_event_for_descriptor(self)
+            .map_err(BackendError::RemoveFromEventLoop)
     }
 
     fn request_transfer_buffer(&mut self, size: usize) -> TransferBuffer {
@@ -513,6 +515,23 @@ impl BackendDevice for FidoPassthroughDevice {
         ));
         device_state.write().unwrap().endpoints = endpoints;
         Ok(())
+    }
+
+    fn reset_control_transfer_state(&mut self) {
+        let control_transfer_state = ControlTransferState {
+            ctl_ep_state: ControlEndpointState::SetupStage,
+            control_request_setup: UsbRequestSetup::new(0, 0, 0, 0, 0),
+            executed: false,
+        };
+        self.control_transfer_state = Arc::new(RwLock::new(control_transfer_state));
+    }
+
+    fn is_lost(&self) -> bool {
+        self.device.lock().is_device_lost
+    }
+
+    fn can_finalize(&self) -> bool {
+        self.is_lost()
     }
 }
 

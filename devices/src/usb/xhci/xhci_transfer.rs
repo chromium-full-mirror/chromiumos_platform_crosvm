@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Display;
 use std::mem;
@@ -27,6 +28,7 @@ use vm_memory::GuestMemoryError;
 use super::device_slot::DeviceSlot;
 use super::interrupter::Error as InterrupterError;
 use super::interrupter::Interrupter;
+use super::ring_buffer_stop_cb::RingBufferStopCallback;
 use super::scatter_gather_buffer::Error as BufferError;
 use super::scatter_gather_buffer::ScatterGatherBuffer;
 use super::usb_hub::Error as HubError;
@@ -46,6 +48,8 @@ use super::xhci_regs::MAX_INTERRUPTER;
 pub enum Error {
     #[error("unexpected trb type: {0:?}")]
     BadTrbType(TrbType),
+    #[error("failed to cancel transfer")]
+    CancelTransfer,
     #[error("cannot cast trb: {0}")]
     CastTrb(TrbError),
     #[error("cannot create transfer buffer: {0}")]
@@ -80,13 +84,16 @@ pub enum TransferDirection {
     Control,
 }
 
-/// Current state of xhci transfer.
+type CancelCallback = Box<dyn FnOnce() -> Result<()> + Send>;
+
+/// Current state of xhci transfer. The transfer in a Submitted or Cancelling state is owned by the
+/// host and should always be reaped to prevent memory leak.
 pub enum XhciTransferState {
     Created,
     /// When transfer is submitted, it will contain a transfer callback, which should be invoked
     /// when the transfer is cancelled.
     Submitted {
-        cancel_callback: Box<dyn FnOnce() + Send>,
+        cancel_callback: CancelCallback,
     },
     Cancelling,
     Cancelled,
@@ -95,19 +102,42 @@ pub enum XhciTransferState {
 
 impl XhciTransferState {
     /// Try to cancel this transfer, if it's possible.
-    pub fn try_cancel(&mut self) {
+    pub fn try_cancel(&mut self, force: bool) -> bool {
+        let mut cancelled = true;
         match mem::replace(self, XhciTransferState::Created) {
             XhciTransferState::Submitted { cancel_callback } => {
-                *self = XhciTransferState::Cancelling;
-                cancel_callback();
+                // If we fail to cancel, there are two cases: the URB has already completed
+                // (EINVAL) or the device is gone (ENODEV). For both cases, we put back the state
+                // to Submitted and check the URB status in the completion handler, to report the
+                // already completed one properly to the guest. However, we can't do that once we
+                // have cancelled a preceding request, because the request must be processed in the
+                // order of submission.
+                match cancel_callback() {
+                    Ok(()) => {
+                        *self = XhciTransferState::Cancelling;
+                    }
+                    Err(_e) => {
+                        if force {
+                            *self = XhciTransferState::Cancelling;
+                        } else {
+                            let error_callback = Box::new(move || Err(Error::CancelTransfer));
+                            *self = XhciTransferState::Submitted {
+                                cancel_callback: error_callback,
+                            };
+                            cancelled = false;
+                        }
+                    }
+                }
             }
             XhciTransferState::Cancelling => {
                 error!("Another cancellation is already issued.");
+                *self = XhciTransferState::Cancelling;
             }
             _ => {
                 *self = XhciTransferState::Cancelled;
             }
         }
+        cancelled
     }
 }
 
@@ -146,16 +176,18 @@ impl Display for XhciTransferType {
 /// needed.
 #[derive(Clone)]
 pub struct XhciTransferManager {
-    transfers: Arc<Mutex<Vec<Weak<Mutex<XhciTransferState>>>>>,
+    transfers: Arc<Mutex<VecDeque<Weak<Mutex<XhciTransferState>>>>>,
     device_slot: Weak<DeviceSlot>,
+    stop_callback: Arc<Mutex<Vec<RingBufferStopCallback>>>,
 }
 
 impl XhciTransferManager {
     /// Create a new manager.
     pub fn new(device_slot: Weak<DeviceSlot>) -> XhciTransferManager {
         XhciTransferManager {
-            transfers: Arc::new(Mutex::new(Vec::new())),
+            transfers: Arc::new(Mutex::new(VecDeque::new())),
             device_slot,
+            stop_callback: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -172,7 +204,7 @@ impl XhciTransferManager {
         stream_id: Option<u16>,
     ) -> XhciTransfer {
         let transfer_dir = {
-            if endpoint_id == 0 {
+            if endpoint_id == 1 {
                 TransferDirection::Control
             } else if (endpoint_id % 2) == 0 {
                 TransferDirection::Out
@@ -194,13 +226,19 @@ impl XhciTransferManager {
             device_slot: self.device_slot.clone(),
             stream_id,
         };
-        self.transfers.lock().push(Arc::downgrade(&t.state));
+        self.transfers.lock().push_back(Arc::downgrade(&t.state));
         t
     }
 
-    /// Cancel all current transfers.
-    pub fn cancel_all(&self) {
-        self.transfers.lock().iter().for_each(|t| {
+    /// Cancel all current transfers and execute the callback once completed.
+    pub fn cancel_all(&self, callback: RingBufferStopCallback) {
+        let locked_transfers = self.transfers.lock();
+        if !locked_transfers.is_empty() {
+            self.stop_callback.lock().push(callback);
+        }
+
+        let mut force_cancel = false;
+        locked_transfers.iter().for_each(|t| {
             let state = match t.upgrade() {
                 Some(state) => state,
                 None => {
@@ -208,7 +246,7 @@ impl XhciTransferManager {
                     return;
                 }
             };
-            state.lock().try_cancel();
+            force_cancel |= state.lock().try_cancel(force_cancel);
         });
     }
 
@@ -220,8 +258,11 @@ impl XhciTransferManager {
         }) {
             None => error!("attempted to remove unknown transfer"),
             Some(i) => {
-                transfers.swap_remove(i);
+                transfers.remove(i);
             }
+        }
+        if transfers.is_empty() {
+            self.stop_callback.lock().clear();
         }
     }
 }
@@ -384,6 +425,7 @@ impl XhciTransfer {
                     event_data: true,
                 });
                 edtla = 0;
+                self.report_completion(atrb);
                 continue;
             }
 
@@ -441,8 +483,17 @@ impl XhciTransfer {
                     event_data: false,
                 });
             }
+
+            // The dequeue pointer still needs to be advanced after a Short Packet.
+            self.report_completion(atrb);
         }
         Ok(actions)
+    }
+
+    fn report_completion(&self, trb: &AddressedTrb) {
+        if let Some(device_slot) = self.device_slot.upgrade() {
+            device_slot.report_trb_completion(self.endpoint_id, self.stream_id, trb);
+        }
     }
 
     /// This functions should be invoked when transfer is completed (or failed).
@@ -454,39 +505,32 @@ impl XhciTransfer {
         match status {
             TransferStatus::NoDevice => {
                 info!("xhci: device disconnected, detaching from port");
-                // If the device is gone, we don't need to send transfer completion event, cause we
-                // are going to destroy everything related to this device anyway.
-                return match self.port.detach() {
-                    Ok(()) => Ok(()),
-                    // It's acceptable for the port to be already disconnected
-                    // as asynchronous transfer completions are processed.
-                    Err(HubError::AlreadyDetached(_e)) => Ok(()),
-                    Err(e) => Err(Error::DetachPort(e)),
-                };
-            }
-            TransferStatus::Cancelled => {
-                // TODO(jkwang) According to the spec, we should send a stopped event here. But
-                // kernel driver does not do anything meaningful when it sees a stopped event.
+                // Actual port detachment is handled by the UsbUtilEventHandler.
                 return self
                     .transfer_completion_event
                     .signal()
                     .map_err(Error::WriteCompletionEvent);
             }
-            TransferStatus::Completed | TransferStatus::Stalled => {
-                self.transfer_completion_event
+            TransferStatus::Cancelled => {
+                return self
+                    .transfer_completion_event
                     .signal()
-                    .map_err(Error::WriteCompletionEvent)?;
+                    .map_err(Error::WriteCompletionEvent);
             }
-            _ => {
+            TransferStatus::Completed => {}
+            TransferStatus::Stalled => {
+                // This is not a critical error, especially during the enumeration. Some devices
+                // takes time to become ready and may return StallError until then. A mass storage
+                // may also return StallError on checking write-protection.
+            }
+            TransferStatus::Error => {
                 // Transfer failed, we are not handling this correctly yet. Guest kernel might see
                 // short packets for in transfer and might think control transfer is successful. It
                 // will eventually find out device is in a wrong state.
-                self.transfer_completion_event
-                    .signal()
-                    .map_err(Error::WriteCompletionEvent)?;
             }
         }
 
+        let mut halted = false;
         let actions = self.process_td_results(status, bytes_transferred)?;
         for action in actions {
             match action {
@@ -513,11 +557,22 @@ impl XhciTransfer {
                         device_slot
                             .halt_endpoint(self.endpoint_id)
                             .map_err(|_| Error::HaltEndpoint(self.endpoint_id))?;
+                        halted = true;
                     }
                 }
             }
         }
-        Ok(())
+
+        // Since the event loop is single threaded, there's no need to trigger it early. We delay
+        // it to the end so that its error, if it ever occurs, won't cause the above transfer
+        // events to be omitted.
+        if !halted {
+            self.transfer_completion_event
+                .signal()
+                .map_err(Error::WriteCompletionEvent)
+        } else {
+            Ok(())
+        }
     }
 
     /// Send this transfer to backend if it's a valid transfer.
