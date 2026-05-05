@@ -7,6 +7,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use base::errno_result;
 use base::error;
@@ -59,17 +60,14 @@ pub struct HaxmVm {
     vm_id: u32,
     descriptor: SafeDescriptor,
     guest_mem: GuestMemory,
-    mem_regions: Arc<Mutex<BTreeMap<MemSlot, (GuestAddress, Box<dyn MappedRegion>)>>>,
+    mem_regions: Mutex<BTreeMap<MemSlot, (GuestAddress, Box<dyn MappedRegion>)>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
-    mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
+    mem_slot_gaps: Mutex<BinaryHeap<Reverse<MemSlot>>>,
     // HAXM's implementation of ioevents makes several assumptions about how crosvm uses ioevents:
-    //   1. All ioevents are registered during device setup, and thus can be cloned when the vm is
-    //      cloned instead of locked in an Arc<Mutex<>>. This will make handling ioevents in each
-    //      vcpu thread easier because no locks will need to be acquired.
-    //   2. All ioevents use Datamatch::AnyLength. We don't bother checking the datamatch, which
+    //   1. All ioevents use Datamatch::AnyLength. We don't bother checking the datamatch, which
     //      will make this faster.
-    //   3. We only ever register one eventfd to each address. This simplifies our data structure.
-    ioevents: FnvHashMap<IoEventAddress, Event>,
+    //   2. We only ever register one eventfd to each address. This simplifies our data structure.
+    ioevents: RwLock<FnvHashMap<IoEventAddress, Event>>,
 }
 
 impl HaxmVm {
@@ -106,9 +104,9 @@ impl HaxmVm {
             haxm: haxm.try_clone()?,
             descriptor: vm_descriptor,
             guest_mem,
-            mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
-            mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
-            ioevents: FnvHashMap::default(),
+            mem_regions: Default::default(),
+            mem_slot_gaps: Default::default(),
+            ioevents: Default::default(),
         })
     }
 
@@ -210,22 +208,6 @@ unsafe fn set_user_memory_region(
 }
 
 impl Vm for HaxmVm {
-    fn try_clone(&self) -> Result<Self> {
-        let mut ioevents = FnvHashMap::default();
-        for (addr, evt) in self.ioevents.iter() {
-            ioevents.insert(*addr, evt.try_clone()?);
-        }
-        Ok(HaxmVm {
-            vm_id: self.vm_id,
-            haxm: self.haxm.try_clone()?,
-            descriptor: self.descriptor.try_clone()?,
-            guest_mem: self.guest_mem.clone(),
-            mem_regions: self.mem_regions.clone(),
-            mem_slot_gaps: self.mem_slot_gaps.clone(),
-            ioevents,
-        })
-    }
-
     fn try_clone_descriptor(&self) -> Result<SafeDescriptor> {
         Err(Error::new(ENOTSUP))
     }
@@ -251,7 +233,7 @@ impl Vm for HaxmVm {
     }
 
     fn add_memory_region(
-        &mut self,
+        &self,
         guest_addr: GuestAddress,
         mem: Box<dyn MappedRegion>,
         read_only: bool,
@@ -293,7 +275,7 @@ impl Vm for HaxmVm {
         Ok(slot)
     }
 
-    fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()> {
+    fn msync_memory_region(&self, slot: MemSlot, offset: usize, size: usize) -> Result<()> {
         let mut regions = self.mem_regions.lock();
         let (_, mem) = regions.get_mut(&slot).ok_or(Error::new(ENOENT))?;
 
@@ -305,7 +287,7 @@ impl Vm for HaxmVm {
         })
     }
 
-    fn remove_memory_region(&mut self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
+    fn remove_memory_region(&self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
         let mut regions = self.mem_regions.lock();
 
         if let Some((guest_addr, mem)) = regions.get(&slot) {
@@ -338,7 +320,7 @@ impl Vm for HaxmVm {
     }
 
     fn register_ioevent(
-        &mut self,
+        &self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -348,18 +330,22 @@ impl Vm for HaxmVm {
             return Err(Error::new(ENOTSUP));
         }
 
-        if self.ioevents.contains_key(&addr) {
+        let evt = evt.try_clone()?;
+
+        let mut ioevents = self.ioevents.write().unwrap();
+
+        if ioevents.contains_key(&addr) {
             error!("HAXM does not support multiple ioevents for the same address");
             return Err(Error::new(EEXIST));
         }
 
-        self.ioevents.insert(addr, evt.try_clone()?);
+        ioevents.insert(addr, evt);
 
         Ok(())
     }
 
     fn unregister_ioevent(
-        &mut self,
+        &self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -369,13 +355,14 @@ impl Vm for HaxmVm {
             return Err(Error::new(ENOTSUP));
         }
 
-        match self.ioevents.get(&addr) {
+        let mut ioevents = self.ioevents.write().unwrap();
+        match ioevents.get(&addr) {
             Some(existing_evt) => {
                 // evt should match the existing evt associated with addr
                 if evt != existing_evt {
                     return Err(Error::new(ENOENT));
                 }
-                self.ioevents.remove(&addr);
+                ioevents.remove(&addr);
             }
 
             None => {
@@ -388,13 +375,13 @@ impl Vm for HaxmVm {
     /// Trigger any io events based on the memory mapped IO at `addr`.  If the hypervisor does
     /// in-kernel IO event delivery, this is a no-op.
     fn handle_io_events(&self, addr: IoEventAddress, _data: &[u8]) -> Result<()> {
-        if let Some(evt) = self.ioevents.get(&addr) {
+        if let Some(evt) = self.ioevents.read().unwrap().get(&addr) {
             evt.signal()?;
         }
         Ok(())
     }
 
-    fn enable_hypercalls(&mut self, _nr: u64, _count: usize) -> Result<()> {
+    fn enable_hypercalls(&self, _nr: u64, _count: usize) -> Result<()> {
         Err(Error::new(ENOTSUP))
     }
 
@@ -409,7 +396,7 @@ impl Vm for HaxmVm {
     }
 
     fn add_fd_mapping(
-        &mut self,
+        &self,
         slot: u32,
         offset: usize,
         size: usize,
@@ -427,7 +414,7 @@ impl Vm for HaxmVm {
         }
     }
 
-    fn remove_mapping(&mut self, slot: u32, offset: usize, size: usize) -> Result<()> {
+    fn remove_mapping(&self, slot: u32, offset: usize, size: usize) -> Result<()> {
         let mut regions = self.mem_regions.lock();
         let (_, region) = regions.get_mut(&slot).ok_or(Error::new(EINVAL))?;
 
@@ -438,7 +425,7 @@ impl Vm for HaxmVm {
         }
     }
 
-    fn handle_balloon_event(&mut self, _event: crate::BalloonEvent) -> Result<()> {
+    fn handle_balloon_event(&self, _event: crate::BalloonEvent) -> Result<()> {
         // TODO(b/233773610): implement ballooning support in haxm
         warn!("Memory ballooning attempted but not supported on haxm hypervisor");
         // no-op
@@ -456,7 +443,7 @@ impl VmX86_64 for HaxmVm {
         &self.haxm
     }
 
-    fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuX86_64>> {
+    fn create_vcpu(&self, id: usize) -> Result<Arc<dyn VcpuX86_64>> {
         // SAFETY:
         // Safe because we know that our file is a VM fd and we verify the return result.
         let fd = unsafe { ioctl_with_ref(self, HAX_VM_IOCTL_VCPU_CREATE, &(id as u32)) };
@@ -479,7 +466,7 @@ impl VmX86_64 for HaxmVm {
             return errno_result();
         }
 
-        Ok(Box::new(HaxmVcpu {
+        Ok(Arc::new(HaxmVcpu {
             descriptor,
             id,
             tunnel: tunnel_info.va as *mut hax_tunnel,
@@ -499,11 +486,7 @@ impl VmX86_64 for HaxmVm {
         Ok(())
     }
 
-    fn load_protected_vm_firmware(
-        &mut self,
-        _fw_addr: GuestAddress,
-        _fw_max_size: u64,
-    ) -> Result<()> {
+    fn load_protected_vm_firmware(&self, _fw_addr: GuestAddress, _fw_max_size: u64) -> Result<()> {
         // Haxm does not support protected VMs
         Err(Error::new(libc::ENXIO))
     }

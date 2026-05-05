@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use base::error;
 use base::info;
@@ -68,23 +69,17 @@ use crate::VmX86_64;
 
 pub struct WhpxVm {
     whpx: Whpx,
-    // reference counted, since we need to implement try_clone or some variation.
-    // There is only ever 1 create/1 delete partition unlike dup/close handle variations.
+    // reference counted, since it is shared with WhpxVcpu.
     vm_partition: Arc<SafePartition>,
     guest_mem: GuestMemory,
-    mem_regions: Arc<Mutex<BTreeMap<MemSlot, (GuestAddress, Box<dyn MappedRegion>)>>>,
+    mem_regions: Mutex<BTreeMap<MemSlot, (GuestAddress, Box<dyn MappedRegion>)>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
-    mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
+    mem_slot_gaps: Mutex<BinaryHeap<Reverse<MemSlot>>>,
     // WHPX's implementation of ioevents makes several assumptions about how crosvm uses ioevents:
-    //   1. All ioevents are registered during device setup, and thus can be cloned when the vm is
-    //      cloned instead of locked in an Arc<Mutex<>>. This will make handling ioevents in each
-    //      vcpu thread easier because no locks will need to be acquired.
-    //   2. All ioevents use Datamatch::AnyLength. We don't bother checking the datamatch, which
+    //   1. All ioevents use Datamatch::AnyLength. We don't bother checking the datamatch, which
     //      will make this faster.
-    //   3. We only ever register one eventfd to each address. This simplifies our data structure.
-    ioevents: FnvHashMap<IoEventAddress, Event>,
-    // Tube to send events to control.
-    vm_evt_wrtube: Option<SendTube>,
+    //   2. We only ever register one eventfd to each address. This simplifies our data structure.
+    ioevents: RwLock<FnvHashMap<IoEventAddress, Event>>,
 }
 
 impl WhpxVm {
@@ -94,7 +89,7 @@ impl WhpxVm {
         guest_mem: GuestMemory,
         cpuid: CpuId,
         apic_emulation: bool,
-        vm_evt_wrtube: Option<SendTube>,
+        _vm_evt_wrtube: Option<SendTube>,
     ) -> WhpxResult<WhpxVm> {
         let partition = SafePartition::new()?;
         // setup partition defaults.
@@ -242,10 +237,9 @@ impl WhpxVm {
             whpx: whpx.clone(),
             vm_partition: Arc::new(partition),
             guest_mem,
-            mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
-            mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
-            ioevents: FnvHashMap::default(),
-            vm_evt_wrtube,
+            mem_regions: Default::default(),
+            mem_slot_gaps: Default::default(),
+            ioevents: Default::default(),
         })
     }
 
@@ -269,7 +263,7 @@ impl WhpxVm {
     }
 
     /// Set the current state of the specified VCPU's local APIC
-    pub fn set_vcpu_lapic_state(&mut self, vcpu_id: usize, state: &LapicState) -> Result<()> {
+    pub fn set_vcpu_lapic_state(&self, vcpu_id: usize, state: &LapicState) -> Result<()> {
         let buffer = WhpxLapicState::from(state);
         check_whpx!(unsafe {
             WHvSetVirtualProcessorInterruptControllerState(
@@ -346,7 +340,7 @@ impl WhpxVm {
     ///
     /// This will make crosvm unable to access the memory, and allow Windows to reclaim it for other
     /// uses when memory is in demand.
-    fn handle_inflate(&mut self, guest_address: GuestAddress, size: u64) -> Result<()> {
+    fn handle_inflate(&self, guest_address: GuestAddress, size: u64) -> Result<()> {
         info!(
             "Balloon: Requested WHPX unmap of addr: {:?}, size: {:?}",
             guest_address, size
@@ -386,7 +380,7 @@ impl WhpxVm {
     /// To do this, reclaim the memory from Windows first, then remap it into the hypervisor
     /// partition. Remapped memory has no guarantee of content, and the guest should not expect
     /// it to.
-    fn handle_deflate(&mut self, guest_address: GuestAddress, size: u64) -> Result<()> {
+    fn handle_deflate(&self, guest_address: GuestAddress, size: u64) -> Result<()> {
         info!(
             "Balloon: Requested WHPX unmap of addr: {:?}, size: {:?}",
             guest_address, size
@@ -482,26 +476,6 @@ pub fn dirty_log_bitmap_size(size: usize) -> usize {
 }
 
 impl Vm for WhpxVm {
-    /// Makes a shallow clone of this `Vm`.
-    fn try_clone(&self) -> Result<Self> {
-        let mut ioevents = FnvHashMap::default();
-        for (addr, evt) in self.ioevents.iter() {
-            ioevents.insert(*addr, evt.try_clone()?);
-        }
-        Ok(WhpxVm {
-            whpx: self.whpx.try_clone()?,
-            vm_partition: self.vm_partition.clone(),
-            guest_mem: self.guest_mem.clone(),
-            mem_regions: self.mem_regions.clone(),
-            mem_slot_gaps: self.mem_slot_gaps.clone(),
-            ioevents,
-            vm_evt_wrtube: self
-                .vm_evt_wrtube
-                .as_ref()
-                .map(|t| t.try_clone().expect("could not clone vm_evt_wrtube")),
-        })
-    }
-
     fn try_clone_descriptor(&self) -> Result<SafeDescriptor> {
         Err(Error::new(ENOTSUP))
     }
@@ -538,7 +512,7 @@ impl Vm for WhpxVm {
     }
 
     fn add_memory_region(
-        &mut self,
+        &self,
         guest_addr: GuestAddress,
         mem: Box<dyn MappedRegion>,
         read_only: bool,
@@ -580,7 +554,7 @@ impl Vm for WhpxVm {
         Ok(slot)
     }
 
-    fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()> {
+    fn msync_memory_region(&self, slot: MemSlot, offset: usize, size: usize) -> Result<()> {
         let mut regions = self.mem_regions.lock();
         let (_, mem) = regions.get_mut(&slot).ok_or(Error::new(ENOENT))?;
 
@@ -592,7 +566,7 @@ impl Vm for WhpxVm {
         })
     }
 
-    fn remove_memory_region(&mut self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
+    fn remove_memory_region(&self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
         let mut regions = self.mem_regions.lock();
         if !regions.contains_key(&slot) {
             return Err(Error::new(ENOENT));
@@ -652,7 +626,7 @@ impl Vm for WhpxVm {
     }
 
     fn register_ioevent(
-        &mut self,
+        &self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -662,18 +636,22 @@ impl Vm for WhpxVm {
             return Err(Error::new(ENOTSUP));
         }
 
-        if self.ioevents.contains_key(&addr) {
+        let evt = evt.try_clone()?;
+
+        let mut ioevents = self.ioevents.write().unwrap();
+
+        if ioevents.contains_key(&addr) {
             error!("WHPX does not support multiple ioevents for the same address");
             return Err(Error::new(EEXIST));
         }
 
-        self.ioevents.insert(addr, evt.try_clone()?);
+        ioevents.insert(addr, evt);
 
         Ok(())
     }
 
     fn unregister_ioevent(
-        &mut self,
+        &self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -683,13 +661,15 @@ impl Vm for WhpxVm {
             return Err(Error::new(ENOTSUP));
         }
 
-        match self.ioevents.get(&addr) {
+        let mut ioevents = self.ioevents.write().unwrap();
+
+        match ioevents.get(&addr) {
             Some(existing_evt) => {
                 // evt should match the existing evt associated with addr
                 if evt != existing_evt {
                     return Err(Error::new(ENOENT));
                 }
-                self.ioevents.remove(&addr);
+                ioevents.remove(&addr);
             }
 
             None => {
@@ -702,7 +682,7 @@ impl Vm for WhpxVm {
     /// Trigger any io events based on the memory mapped IO at `addr`.  If the hypervisor does
     /// in-kernel IO event delivery, this is a no-op.
     fn handle_io_events(&self, addr: IoEventAddress, _data: &[u8]) -> Result<()> {
-        match self.ioevents.get(&addr) {
+        match self.ioevents.read().unwrap().get(&addr) {
             None => {}
             Some(evt) => {
                 evt.signal()?;
@@ -711,7 +691,7 @@ impl Vm for WhpxVm {
         Ok(())
     }
 
-    fn enable_hypercalls(&mut self, _nr: u64, _count: usize) -> Result<()> {
+    fn enable_hypercalls(&self, _nr: u64, _count: usize) -> Result<()> {
         Err(Error::new(ENOTSUP))
     }
 
@@ -724,7 +704,7 @@ impl Vm for WhpxVm {
     }
 
     fn add_fd_mapping(
-        &mut self,
+        &self,
         slot: u32,
         offset: usize,
         size: usize,
@@ -742,7 +722,7 @@ impl Vm for WhpxVm {
         }
     }
 
-    fn remove_mapping(&mut self, slot: u32, offset: usize, size: usize) -> Result<()> {
+    fn remove_mapping(&self, slot: u32, offset: usize, size: usize) -> Result<()> {
         let mut regions = self.mem_regions.lock();
         let (_, region) = regions.get_mut(&slot).ok_or(Error::new(EINVAL))?;
 
@@ -753,7 +733,7 @@ impl Vm for WhpxVm {
         }
     }
 
-    fn handle_balloon_event(&mut self, event: BalloonEvent) -> Result<()> {
+    fn handle_balloon_event(&self, event: BalloonEvent) -> Result<()> {
         match event {
             BalloonEvent::Inflate(m) => self.handle_inflate(m.guest_address, m.size),
             BalloonEvent::Deflate(m) => self.handle_deflate(m.guest_address, m.size),
@@ -772,8 +752,8 @@ impl VmX86_64 for WhpxVm {
         &self.whpx
     }
 
-    fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuX86_64>> {
-        Ok(Box::new(WhpxVcpu::new(
+    fn create_vcpu(&self, id: usize) -> Result<Arc<dyn VcpuX86_64>> {
+        Ok(Arc::new(WhpxVcpu::new(
             self.vm_partition.clone(),
             id.try_into().unwrap(),
         )?))
@@ -793,11 +773,7 @@ impl VmX86_64 for WhpxVm {
         Ok(())
     }
 
-    fn load_protected_vm_firmware(
-        &mut self,
-        _fw_addr: GuestAddress,
-        _fw_max_size: u64,
-    ) -> Result<()> {
+    fn load_protected_vm_firmware(&self, _fw_addr: GuestAddress, _fw_max_size: u64) -> Result<()> {
         // WHPX does not support protected VMs
         Err(Error::new(libc::ENXIO))
     }
@@ -855,18 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn try_clone() {
-        if !Whpx::is_enabled() {
-            return;
-        }
-        let cpu_count = 1;
-        let mem =
-            GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
-        let vm = new_vm(cpu_count, mem);
-        let _vm_clone = vm.try_clone().expect("failed to clone whpx vm");
-    }
-
-    #[test]
     fn send_vm() {
         if !Whpx::is_enabled() {
             return;
@@ -913,7 +877,7 @@ mod tests {
         let cpu_count = 1;
         let mem =
             GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
-        let mut vm = new_vm(cpu_count, mem);
+        let vm = new_vm(cpu_count, mem);
         let evt = Event::new().expect("failed to create event");
         let otherevt = Event::new().expect("failed to create event");
         vm.register_ioevent(&evt, IoEventAddress::Pio(0xf4), Datamatch::AnyLength)
@@ -968,7 +932,7 @@ mod tests {
         let cpu_count = 1;
         let mem =
             GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
-        let mut vm = new_vm(cpu_count, mem);
+        let vm = new_vm(cpu_count, mem);
         let evt = Event::new().expect("failed to create event");
         let evt2 = Event::new().expect("failed to create event");
         vm.register_ioevent(&evt, IoEventAddress::Pio(0x1000), Datamatch::AnyLength)
@@ -1026,7 +990,7 @@ mod tests {
         let cpu_count = 1;
         let mem =
             GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
-        let mut vm = new_vm(cpu_count, mem);
+        let vm = new_vm(cpu_count, mem);
         let mem_size = 0x1000;
         let shm = SharedMemory::new("test", mem_size as u64).unwrap();
         let mem = MemoryMappingBuilder::new(mem_size)
@@ -1051,7 +1015,7 @@ mod tests {
         let cpu_count = 1;
         let mem =
             GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
-        let mut vm = new_vm(cpu_count, mem);
+        let vm = new_vm(cpu_count, mem);
         let mem_size = 0x1000;
         let shm = SharedMemory::new("test", mem_size as u64).unwrap();
         let mem = MemoryMappingBuilder::new(mem_size)
@@ -1081,7 +1045,7 @@ mod tests {
         let cpu_count = 1;
         let mem =
             GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
-        let mut vm = new_vm(cpu_count, mem);
+        let vm = new_vm(cpu_count, mem);
         assert!(vm.remove_memory_region(0).is_err());
     }
 
@@ -1093,7 +1057,7 @@ mod tests {
         let cpu_count = 1;
         let mem =
             GuestMemory::new(&[(GuestAddress(0), 0x10000)]).expect("failed to create guest memory");
-        let mut vm = new_vm(cpu_count, mem);
+        let vm = new_vm(cpu_count, mem);
         let mem_size = 0x2000;
         let shm = SharedMemory::new("test", mem_size as u64).unwrap();
         let mem = MemoryMappingBuilder::new(mem_size)
@@ -1119,7 +1083,7 @@ mod tests {
         let cpu_count = 1;
         let mem =
             GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
-        let mut vm = new_vm(cpu_count, mem);
+        let vm = new_vm(cpu_count, mem);
         let mem_size = 0x1000;
         let shm = SharedMemory::new("test", mem_size as u64).unwrap();
         let mem = MemoryMappingBuilder::new(mem_size)

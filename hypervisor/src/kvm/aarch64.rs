@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::mem::offset_of;
+use std::sync::Arc;
 
 use aarch64_sys_reg::AArch64SysRegId;
 use anyhow::Context;
@@ -135,7 +136,7 @@ impl KvmVm {
         }
     }
 
-    pub(super) fn enable_smccc_forwarding(&mut self, base: u32, nr_functions: u32) -> Result<()> {
+    pub(super) fn enable_smccc_forwarding(&self, base: u32, nr_functions: u32) -> Result<()> {
         let smccc_filter = kvm_smccc_filter {
             base,
             nr_functions,
@@ -229,11 +230,7 @@ impl VmAArch64 for KvmVm {
         &self.kvm
     }
 
-    fn load_protected_vm_firmware(
-        &mut self,
-        fw_addr: GuestAddress,
-        fw_max_size: u64,
-    ) -> Result<()> {
+    fn load_protected_vm_firmware(&self, fw_addr: GuestAddress, fw_max_size: u64) -> Result<()> {
         let info = self.get_protected_vm_info()?;
         if info.firmware_size == 0 {
             Err(Error::new(ENOENT))
@@ -245,10 +242,10 @@ impl VmAArch64 for KvmVm {
         }
     }
 
-    fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuAArch64>> {
+    fn create_vcpu(&self, id: usize) -> Result<Arc<dyn VcpuAArch64>> {
         // create_vcpu is declared separately in VmAArch64 and VmX86, so it can return VcpuAArch64
         // or VcpuX86.  But both use the same implementation in KvmVm::create_kvm_vcpu.
-        Ok(Box::new(self.create_kvm_vcpu(id)?))
+        Ok(Arc::new(self.create_kvm_vcpu(id)?))
     }
 
     fn create_fdt(&self, _fdt: &mut Fdt, _phandles: &BTreeMap<&str, u32>) -> cros_fdt::Result<()> {

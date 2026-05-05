@@ -2,16 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::sync::Arc;
+
 use base::error;
 use base::Error;
 use base::Event;
 use base::Result;
 #[cfg(target_arch = "x86_64")]
 use hypervisor::kvm::KvmCap;
-use hypervisor::kvm::KvmVcpu;
 use hypervisor::IrqRoute;
 use hypervisor::MPState;
-use hypervisor::Vcpu;
+use hypervisor::VcpuArch;
 use kvm_sys::kvm_mp_state;
 use resources::SystemAllocator;
 
@@ -43,11 +44,11 @@ use crate::VcpuRunState;
 /// This IrqChip only works with Kvm so we only implement it for KvmVcpu.
 impl IrqChip for KvmKernelIrqChip {
     /// Add a vcpu to the irq chip.
-    fn add_vcpu(&mut self, vcpu_id: usize, vcpu: &dyn Vcpu) -> Result<()> {
-        let vcpu: &KvmVcpu = vcpu
-            .downcast_ref()
+    fn add_vcpu(&mut self, vcpu_id: usize, vcpu: Arc<dyn VcpuArch>) -> Result<()> {
+        let vcpu = Arc::downcast(vcpu)
+            .map_err(|_| ())
             .expect("KvmKernelIrqChip::add_vcpu called with non-KvmVcpu");
-        self.vcpus.lock()[vcpu_id] = Some(vcpu.try_clone()?);
+        self.vcpus.lock()[vcpu_id] = Some(vcpu);
         Ok(())
     }
 
@@ -140,7 +141,7 @@ impl IrqChip for KvmKernelIrqChip {
     /// Injects any pending interrupts for `vcpu`.
     /// For KvmKernelIrqChip this is a no-op because KVM is responsible for injecting all
     /// interrupts.
-    fn inject_interrupts(&self, _vcpu: &dyn Vcpu) -> Result<()> {
+    fn inject_interrupts(&self, _vcpu: &dyn VcpuArch) -> Result<()> {
         Ok(())
     }
 
@@ -153,7 +154,7 @@ impl IrqChip for KvmKernelIrqChip {
     /// `VcpuRunState::Interrupted` if the wait was interrupted.
     /// For KvmKernelIrqChip this is a no-op and always returns Runnable because KVM handles VCPU
     /// blocking.
-    fn wait_until_runnable(&self, _vcpu: &dyn Vcpu) -> Result<VcpuRunState> {
+    fn wait_until_runnable(&self, _vcpu: &dyn VcpuArch) -> Result<VcpuRunState> {
         Ok(VcpuRunState::Runnable)
     }
 

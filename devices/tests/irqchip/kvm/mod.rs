@@ -6,12 +6,13 @@
 
 mod x86_64;
 
+use std::sync::Arc;
+
 use devices::irqchip::IrqChip;
 use devices::irqchip::KvmKernelIrqChip;
 use hypervisor::kvm::Kvm;
 use hypervisor::kvm::KvmVm;
 use hypervisor::MPState;
-use hypervisor::Vm;
 #[cfg(target_arch = "aarch64")]
 use hypervisor::VmAArch64;
 #[cfg(target_arch = "riscv64")]
@@ -24,10 +25,10 @@ use vm_memory::GuestMemory;
 fn create_kvm_kernel_irqchip() {
     let kvm = Kvm::new().expect("failed to instantiate Kvm");
     let mem = GuestMemory::new(&[]).unwrap();
-    let vm = KvmVm::new(&kvm, mem, Default::default()).expect("failed to instantiate vm");
+    let vm = Arc::new(KvmVm::new(&kvm, mem, Default::default()).expect("failed to instantiate vm"));
 
     let mut chip = KvmKernelIrqChip::new(
-        vm.try_clone().expect("failed to clone vm"),
+        vm.clone(),
         1,
         #[cfg(target_arch = "aarch64")]
         /* allow_vgic_its= */
@@ -36,8 +37,7 @@ fn create_kvm_kernel_irqchip() {
     .expect("failed to instantiate KvmKernelIrqChip");
 
     let vcpu = vm.create_vcpu(0).expect("failed to instantiate vcpu");
-    chip.add_vcpu(0, vcpu.as_vcpu())
-        .expect("failed to add vcpu");
+    chip.add_vcpu(0, vcpu).expect("failed to add vcpu");
 }
 
 #[test]
@@ -45,28 +45,23 @@ fn create_kvm_kernel_irqchip() {
 fn create_kvm_kernel_irqchip_with_its() {
     let kvm = Kvm::new().expect("failed to instantiate Kvm");
     let mem = GuestMemory::new(&[]).unwrap();
-    let vm = KvmVm::new(&kvm, mem, Default::default()).expect("failed to instantiate vm");
+    let vm = Arc::new(KvmVm::new(&kvm, mem, Default::default()).expect("failed to instantiate vm"));
 
-    let mut chip = KvmKernelIrqChip::new(
-        vm.try_clone().expect("failed to clone vm"),
-        1,
-        /* allow_vgic_its= */ true,
-    )
-    .expect("failed to instantiate KvmKernelIrqChip");
+    let mut chip = KvmKernelIrqChip::new(vm.clone(), 1, /* allow_vgic_its= */ true)
+        .expect("failed to instantiate KvmKernelIrqChip");
 
     let vcpu = vm.create_vcpu(0).expect("failed to instantiate vcpu");
-    chip.add_vcpu(0, vcpu.as_vcpu())
-        .expect("failed to add vcpu");
+    chip.add_vcpu(0, vcpu).expect("failed to add vcpu");
 }
 
 #[test]
 fn mp_state() {
     let kvm = Kvm::new().expect("failed to instantiate Kvm");
     let mem = GuestMemory::new(&[]).unwrap();
-    let vm = KvmVm::new(&kvm, mem, Default::default()).expect("failed to instantiate vm");
+    let vm = Arc::new(KvmVm::new(&kvm, mem, Default::default()).expect("failed to instantiate vm"));
 
     let mut chip = KvmKernelIrqChip::new(
-        vm.try_clone().expect("failed to clone vm"),
+        vm.clone(),
         1,
         #[cfg(target_arch = "aarch64")]
         /* allow_vgic_its= */
@@ -75,8 +70,7 @@ fn mp_state() {
     .expect("failed to instantiate KvmKernelIrqChip");
 
     let vcpu = vm.create_vcpu(0).expect("failed to instantiate vcpu");
-    chip.add_vcpu(0, vcpu.as_vcpu())
-        .expect("failed to add vcpu");
+    chip.add_vcpu(0, vcpu).expect("failed to add vcpu");
 
     let state = chip.get_mp_state(0).expect("failed to get mp state");
     assert_eq!(state, MPState::Runnable);

@@ -58,8 +58,13 @@ pub use fdt::apply_device_tree_overlays;
 pub use fdt::DtbOverlay;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
+pub use hypervisor::CpuConfigArch;
+pub use hypervisor::HypervisorArch;
 use hypervisor::MemCacheType;
+pub use hypervisor::VcpuArch;
+pub use hypervisor::VcpuInitArch;
 use hypervisor::Vm;
+pub use hypervisor::VmArch;
 #[cfg(windows)]
 use jail::FakeMinijailStub as Minijail;
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -96,29 +101,14 @@ cfg_if::cfg_if! {
         pub use devices::IrqChipAArch64 as IrqChipArch;
         #[cfg(feature = "gdb")]
         pub use gdbstub_arch::aarch64::AArch64 as GdbArch;
-        pub use hypervisor::CpuConfigAArch64 as CpuConfigArch;
-        pub use hypervisor::Hypervisor as HypervisorArch;
-        pub use hypervisor::VcpuAArch64 as VcpuArch;
-        pub use hypervisor::VcpuInitAArch64 as VcpuInitArch;
-        pub use hypervisor::VmAArch64 as VmArch;
     } else if #[cfg(target_arch = "riscv64")] {
         pub use devices::IrqChipRiscv64 as IrqChipArch;
         #[cfg(feature = "gdb")]
         pub use gdbstub_arch::riscv::Riscv64 as GdbArch;
-        pub use hypervisor::CpuConfigRiscv64 as CpuConfigArch;
-        pub use hypervisor::Hypervisor as HypervisorArch;
-        pub use hypervisor::VcpuInitRiscv64 as VcpuInitArch;
-        pub use hypervisor::VcpuRiscv64 as VcpuArch;
-        pub use hypervisor::VmRiscv64 as VmArch;
     } else if #[cfg(target_arch = "x86_64")] {
         pub use devices::IrqChipX86_64 as IrqChipArch;
         #[cfg(feature = "gdb")]
         pub use gdbstub_arch::x86::X86_64_SSE as GdbArch;
-        pub use hypervisor::CpuConfigX86_64 as CpuConfigArch;
-        pub use hypervisor::HypervisorX86_64 as HypervisorArch;
-        pub use hypervisor::VcpuInitX86_64 as VcpuInitArch;
-        pub use hypervisor::VcpuX86_64 as VcpuArch;
-        pub use hypervisor::VmX86_64 as VmArch;
     }
 }
 
@@ -560,8 +550,8 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub vcpu_init: Vec<VcpuInitArch>,
     /// If vcpus is None, then it's the responsibility of the vcpu thread to create vcpus.
     /// If it's Some, then `build_vm` already created the vcpus.
-    pub vcpus: Option<Vec<Vcpu>>,
-    pub vm: V,
+    pub vcpus: Option<Vec<Arc<Vcpu>>>,
+    pub vm: Arc<V>,
     pub vm_request_tubes: Vec<Tube>,
 }
 
@@ -637,7 +627,7 @@ pub trait LinuxArch {
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
         battery: (Option<BatteryType>, Option<Minijail>),
-        vm: V,
+        vm: Arc<V>,
         ramoops_region: Option<pstore::RamoopsRegion>,
         devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
         irq_chip: &mut dyn IrqChipArch,
@@ -672,7 +662,7 @@ pub trait LinuxArch {
         vm: &V,
         hypervisor: &dyn HypervisorArch,
         irq_chip: &mut dyn IrqChipArch,
-        vcpu: &mut dyn VcpuArch,
+        vcpu: &dyn VcpuArch,
         vcpu_init: VcpuInitArch,
         vcpu_id: usize,
         num_vcpus: usize,
@@ -1077,7 +1067,7 @@ pub fn generate_pci_root(
     mmio_register_bit_num: usize,
     io_bus: Arc<Bus>,
     resources: &mut SystemAllocator,
-    vm: &mut impl Vm,
+    mut vm: &impl Vm,
     max_irqs: usize,
     vcfg_base: Option<u64>,
     #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
@@ -1278,7 +1268,7 @@ pub fn generate_pci_root(
             device.on_sandboxed();
             Arc::new(Mutex::new(device))
         };
-        root.add_device(address, arced_dev.clone(), vm)
+        root.add_device(address, arced_dev.clone(), &mut vm)
             .map_err(DeviceRegistrationError::PciRootAddDevice)?;
         for range in &ranges {
             mmio_bus

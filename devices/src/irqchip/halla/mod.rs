@@ -9,13 +9,11 @@ use base::Error;
 use base::Event;
 use base::Result;
 use hypervisor::halla::halla_sys::*;
-use hypervisor::halla::HallaVcpu;
 use hypervisor::halla::HallaVm;
 use hypervisor::DeviceKind;
 use hypervisor::IrqRoute;
 use hypervisor::MPState;
-use hypervisor::Vcpu;
-use hypervisor::Vm;
+use hypervisor::VcpuArch;
 use resources::SystemAllocator;
 use sync::Mutex;
 
@@ -44,8 +42,7 @@ fn default_irq_routing_table() -> Vec<IrqRoute> {
 ///
 /// This implementation will use the HVM API to create and configure the in-kernel irqchip.
 pub struct HallaKernelIrqChip {
-    pub(super) vm: HallaVm,
-    pub(super) vcpus: Arc<Mutex<Vec<Option<HallaVcpu>>>>,
+    pub(super) vm: Arc<HallaVm>,
     device_kind: DeviceKind,
     pub(super) routes: Arc<Mutex<Vec<IrqRoute>>>,
 }
@@ -66,7 +63,7 @@ pub const AARCH64_GIC_NR_SPIS: u32 = 32;
 
 impl HallaKernelIrqChip {
     /// Construct a new HallaKernelIrqchip.
-    pub fn new(vm: HallaVm, num_vcpus: usize) -> Result<HallaKernelIrqChip> {
+    pub fn new(vm: Arc<HallaVm>, num_vcpus: usize) -> Result<HallaKernelIrqChip> {
         let dist_if_addr: u64 = AARCH64_GIC_DIST_BASE;
         let redist_addr: u64 = dist_if_addr - (AARCH64_GIC_REDIST_SIZE * num_vcpus as u64);
         let device_kind = DeviceKind::ArmVgicV3;
@@ -110,7 +107,6 @@ impl HallaKernelIrqChip {
 
         Ok(HallaKernelIrqChip {
             vm,
-            vcpus: Arc::new(Mutex::new((0..num_vcpus).map(|_| None).collect())),
             device_kind,
             routes: Arc::new(Mutex::new(default_irq_routing_table())),
         })
@@ -118,8 +114,7 @@ impl HallaKernelIrqChip {
     /// Attempt to create a shallow clone of this aarch64 HallaKernelIrqChip instance.
     pub(super) fn arch_try_clone(&self) -> Result<Self> {
         Ok(HallaKernelIrqChip {
-            vm: self.vm.try_clone()?,
-            vcpus: self.vcpus.clone(),
+            vm: self.vm.clone(),
             device_kind: self.device_kind,
             routes: self.routes.clone(),
         })
@@ -152,14 +147,8 @@ impl IrqChipAArch64 for HallaKernelIrqChip {
     }
 }
 
-/// This IrqChip only works with Halla so we only implement it for HallaVcpu.
 impl IrqChip for HallaKernelIrqChip {
-    /// Add a vcpu to the irq chip.
-    fn add_vcpu(&mut self, vcpu_id: usize, vcpu: &dyn Vcpu) -> Result<()> {
-        let vcpu: &HallaVcpu = vcpu
-            .downcast_ref()
-            .expect("HallaKernelIrqChip::add_vcpu called with non-HallaVcpu");
-        self.vcpus.lock()[vcpu_id] = Some(vcpu.try_clone()?);
+    fn add_vcpu(&mut self, _vcpu_id: usize, _vcpu: Arc<dyn VcpuArch>) -> Result<()> {
         Ok(())
     }
 
@@ -250,7 +239,7 @@ impl IrqChip for HallaKernelIrqChip {
     /// Injects any pending interrupts for `vcpu`.
     /// For HallaKernelIrqChip this is a no-op because Halla is responsible for injecting
     /// all interrupts.
-    fn inject_interrupts(&self, _vcpu: &dyn Vcpu) -> Result<()> {
+    fn inject_interrupts(&self, _vcpu: &dyn VcpuArch) -> Result<()> {
         Ok(())
     }
 
@@ -263,7 +252,7 @@ impl IrqChip for HallaKernelIrqChip {
     /// `VcpuRunState::Interrupted` if the wait was interrupted.
     /// For HallaKernelIrqChip this is a no-op and always returns Runnable because Halla
     /// handles VCPU blocking.
-    fn wait_until_runnable(&self, _vcpu: &dyn Vcpu) -> Result<VcpuRunState> {
+    fn wait_until_runnable(&self, _vcpu: &dyn VcpuArch) -> Result<VcpuRunState> {
         Ok(VcpuRunState::Runnable)
     }
 

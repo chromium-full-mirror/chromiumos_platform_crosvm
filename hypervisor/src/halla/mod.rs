@@ -169,11 +169,7 @@ impl VmAArch64 for HallaVm {
         &self.halla
     }
 
-    fn load_protected_vm_firmware(
-        &mut self,
-        fw_addr: GuestAddress,
-        fw_max_size: u64,
-    ) -> Result<()> {
+    fn load_protected_vm_firmware(&self, fw_addr: GuestAddress, fw_max_size: u64) -> Result<()> {
         let size: u64 = self.get_protected_vm_info()?;
         if size == 0 {
             Err(Error::new(EINVAL))
@@ -185,8 +181,8 @@ impl VmAArch64 for HallaVm {
         }
     }
 
-    fn create_vcpu(&self, id: usize) -> Result<Box<dyn VcpuAArch64>> {
-        Ok(Box::new(HallaVm::create_vcpu(self, id)?))
+    fn create_vcpu(&self, id: usize) -> Result<Arc<dyn VcpuAArch64>> {
+        Ok(Arc::new(HallaVm::create_vcpu(self, id)?))
     }
 
     fn create_fdt(&self, _fdt: &mut Fdt, _phandles: &BTreeMap<&str, u32>) -> cros_fdt::Result<()> {
@@ -604,9 +600,9 @@ pub struct HallaVm {
     halla: Halla,
     vm: SafeDescriptor,
     guest_mem: GuestMemory,
-    mem_regions: Arc<Mutex<BTreeMap<MemSlot, Box<dyn MappedRegion>>>>,
+    mem_regions: Mutex<BTreeMap<MemSlot, Box<dyn MappedRegion>>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
-    mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
+    mem_slot_gaps: Mutex<BinaryHeap<Reverse<MemSlot>>>,
 }
 
 impl HallaVm {
@@ -654,8 +650,8 @@ impl HallaVm {
             halla: halla.try_clone()?,
             vm: vm_descriptor,
             guest_mem,
-            mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
-            mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
+            mem_regions: Default::default(),
+            mem_slot_gaps: Default::default(),
         };
         vm.init_arch(&cfg)?;
         Ok(vm)
@@ -685,7 +681,6 @@ impl HallaVm {
             .map_err(|_| Error::new(ENOSPC))?;
 
         Ok(HallaVcpu {
-            vm: self.vm.try_clone()?,
             vcpu,
             id,
             run_mmap: Arc::new(run_mmap),
@@ -868,7 +863,7 @@ impl HallaVm {
         }
     }
 
-    fn handle_inflate(&mut self, guest_address: GuestAddress, size: u64) -> Result<()> {
+    fn handle_inflate(&self, guest_address: GuestAddress, size: u64) -> Result<()> {
         match self.guest_mem.remove_range(guest_address, size) {
             Ok(_) => Ok(()),
             Err(vm_memory::Error::MemoryAccess(_, MmapError::SystemCallFailed(e))) => Err(e),
@@ -876,23 +871,13 @@ impl HallaVm {
         }
     }
 
-    fn handle_deflate(&mut self, _guest_address: GuestAddress, _size: u64) -> Result<()> {
+    fn handle_deflate(&self, _guest_address: GuestAddress, _size: u64) -> Result<()> {
         // No-op, when the guest attempts to access the pages again, Linux/HVM will provide them.
         Ok(())
     }
 }
 
 impl Vm for HallaVm {
-    fn try_clone(&self) -> Result<Self> {
-        Ok(HallaVm {
-            halla: self.halla.try_clone()?,
-            vm: self.vm.try_clone()?,
-            guest_mem: self.guest_mem.clone(),
-            mem_regions: self.mem_regions.clone(),
-            mem_slot_gaps: self.mem_slot_gaps.clone(),
-        })
-    }
-
     fn try_clone_descriptor(&self) -> Result<SafeDescriptor> {
         error!("try_clone_descriptor hasn't been tested on Halla, returning -ENOTSUP");
         Err(Error::new(ENOTSUP))
@@ -927,7 +912,7 @@ impl Vm for HallaVm {
     }
 
     fn add_memory_region(
-        &mut self,
+        &self,
         guest_addr: GuestAddress,
         mem: Box<dyn MappedRegion>,
         _read_only: bool,
@@ -978,7 +963,7 @@ impl Vm for HallaVm {
         Ok(slot)
     }
 
-    fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()> {
+    fn msync_memory_region(&self, slot: MemSlot, offset: usize, size: usize) -> Result<()> {
         let mut regions = self.mem_regions.lock();
         let mem = regions.get_mut(&slot).ok_or_else(|| Error::new(ENOENT))?;
 
@@ -991,7 +976,7 @@ impl Vm for HallaVm {
     }
 
     fn madvise_pageout_memory_region(
-        &mut self,
+        &self,
         _slot: MemSlot,
         _offset: usize,
         _size: usize,
@@ -1000,7 +985,7 @@ impl Vm for HallaVm {
     }
 
     fn madvise_remove_memory_region(
-        &mut self,
+        &self,
         _slot: MemSlot,
         _offset: usize,
         _size: usize,
@@ -1008,7 +993,7 @@ impl Vm for HallaVm {
         Err(Error::new(ENOTSUP))
     }
 
-    fn remove_memory_region(&mut self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
+    fn remove_memory_region(&self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
         let mut regions = self.mem_regions.lock();
         if !regions.contains_key(&slot) {
             return Err(Error::new(ENOENT));
@@ -1033,7 +1018,7 @@ impl Vm for HallaVm {
     }
 
     fn register_ioevent(
-        &mut self,
+        &self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -1042,7 +1027,7 @@ impl Vm for HallaVm {
     }
 
     fn unregister_ioevent(
-        &mut self,
+        &self,
         evt: &Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
@@ -1055,7 +1040,7 @@ impl Vm for HallaVm {
         Ok(())
     }
 
-    fn enable_hypercalls(&mut self, _nr: u64, _count: usize) -> Result<()> {
+    fn enable_hypercalls(&self, _nr: u64, _count: usize) -> Result<()> {
         Err(Error::new(ENOTSUP))
     }
 
@@ -1068,7 +1053,7 @@ impl Vm for HallaVm {
     }
 
     fn add_fd_mapping(
-        &mut self,
+        &self,
         slot: u32,
         offset: usize,
         size: usize,
@@ -1086,7 +1071,7 @@ impl Vm for HallaVm {
         }
     }
 
-    fn remove_mapping(&mut self, slot: u32, offset: usize, size: usize) -> Result<()> {
+    fn remove_mapping(&self, slot: u32, offset: usize, size: usize) -> Result<()> {
         let mut regions = self.mem_regions.lock();
         let region = regions.get_mut(&slot).ok_or_else(|| Error::new(EINVAL))?;
 
@@ -1097,7 +1082,7 @@ impl Vm for HallaVm {
         }
     }
 
-    fn handle_balloon_event(&mut self, event: BalloonEvent) -> Result<()> {
+    fn handle_balloon_event(&self, event: BalloonEvent) -> Result<()> {
         match event {
             BalloonEvent::Inflate(m) => self.handle_inflate(m.guest_address, m.size),
             BalloonEvent::Deflate(m) => self.handle_deflate(m.guest_address, m.size),
@@ -1129,25 +1114,12 @@ impl VcpuSignalHandleInner for HallaVcpuSignalHandle {
 
 /// A wrapper around using a Halla Vcpu.
 pub struct HallaVcpu {
-    vm: SafeDescriptor,
     vcpu: SafeDescriptor,
     id: usize,
     run_mmap: Arc<MemoryMapping>,
 }
 
 impl Vcpu for HallaVcpu {
-    fn try_clone(&self) -> Result<Self> {
-        let vm = self.vm.try_clone()?;
-        let vcpu = self.vcpu.try_clone()?;
-
-        Ok(HallaVcpu {
-            vm,
-            vcpu,
-            id: self.id,
-            run_mmap: self.run_mmap.clone(),
-        })
-    }
-
     fn as_vcpu(&self) -> &dyn Vcpu {
         self
     }
@@ -1183,7 +1155,7 @@ impl Vcpu for HallaVcpu {
     #[allow(clippy::cast_ptr_alignment)]
     // The pointer is page aligned so casting to a different type is well defined, hence the clippy
     // allow attribute.
-    fn run(&mut self) -> Result<VcpuExit> {
+    fn run(&self) -> Result<VcpuExit> {
         // SAFETY:
         // Safe because we know that our file is a VCPU fd and we verify the return result.
         let ret = unsafe { ioctl_with_val(self, HVM_RUN, self.run_mmap.as_ptr() as u64) };

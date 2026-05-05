@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(feature = "gpu")]
 pub(crate) mod gpu;
 
 use std::io::Result;
@@ -123,7 +122,7 @@ pub fn should_prepare_memory_region() -> bool {
 }
 
 pub fn prepare_shared_memory_region(
-    _vm: &mut dyn Vm,
+    _vm: &dyn Vm,
     _allocator: &mut SystemAllocator,
     _alloc: Alloc,
     _cache: MemCacheType,
