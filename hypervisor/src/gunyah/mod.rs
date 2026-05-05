@@ -664,7 +664,7 @@ impl Vm for GunyahVm {
 
     fn register_ioevent(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()> {
@@ -725,7 +725,7 @@ impl Vm for GunyahVm {
 
     fn unregister_ioevent(
         &self,
-        _evt: &Event,
+        _evt: Event,
         addr: IoEventAddress,
         _datamatch: Datamatch,
     ) -> Result<()> {
@@ -847,10 +847,6 @@ impl AsRawDescriptor for GunyahVcpu {
 }
 
 impl Vcpu for GunyahVcpu {
-    fn as_vcpu(&self) -> &dyn Vcpu {
-        self
-    }
-
     fn run(&self) -> Result<VcpuExit> {
         // SAFETY:
         // Safe because we know our file is a VCPU fd and we verify the return result.

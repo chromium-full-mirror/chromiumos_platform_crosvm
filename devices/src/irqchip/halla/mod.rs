@@ -44,7 +44,7 @@ fn default_irq_routing_table() -> Vec<IrqRoute> {
 pub struct HallaKernelIrqChip {
     pub(super) vm: Arc<HallaVm>,
     device_kind: DeviceKind,
-    pub(super) routes: Arc<Mutex<Vec<IrqRoute>>>,
+    pub(super) routes: Mutex<Vec<IrqRoute>>,
 }
 
 // These constants indicate the address space used by the ARM vGIC.
@@ -108,32 +108,12 @@ impl HallaKernelIrqChip {
         Ok(HallaKernelIrqChip {
             vm,
             device_kind,
-            routes: Arc::new(Mutex::new(default_irq_routing_table())),
-        })
-    }
-    /// Attempt to create a shallow clone of this aarch64 HallaKernelIrqChip instance.
-    pub(super) fn arch_try_clone(&self) -> Result<Self> {
-        Ok(HallaKernelIrqChip {
-            vm: self.vm.clone(),
-            device_kind: self.device_kind,
-            routes: self.routes.clone(),
+            routes: Mutex::new(default_irq_routing_table()),
         })
     }
 }
 
 impl IrqChipAArch64 for HallaKernelIrqChip {
-    fn try_box_clone(&self) -> Result<Box<dyn IrqChipAArch64>> {
-        Ok(Box::new(self.try_clone()?))
-    }
-
-    fn as_irq_chip(&self) -> &dyn IrqChip {
-        self
-    }
-
-    fn as_irq_chip_mut(&mut self) -> &mut dyn IrqChip {
-        self
-    }
-
     fn get_vgic_version(&self) -> DeviceKind {
         self.device_kind
     }
@@ -148,14 +128,14 @@ impl IrqChipAArch64 for HallaKernelIrqChip {
 }
 
 impl IrqChip for HallaKernelIrqChip {
-    fn add_vcpu(&mut self, _vcpu_id: usize, _vcpu: Arc<dyn VcpuArch>) -> Result<()> {
+    fn add_vcpu(&self, _vcpu_id: usize, _vcpu: Arc<dyn VcpuArch>) -> Result<()> {
         Ok(())
     }
 
     /// Register an event with edge-trigger semantic that can trigger an interrupt
     /// for a particular GSI.
     fn register_edge_irq_event(
-        &mut self,
+        &self,
         irq: u32,
         irq_event: &IrqEdgeEvent,
         _source: IrqEventSource,
@@ -165,14 +145,14 @@ impl IrqChip for HallaKernelIrqChip {
     }
 
     /// Unregister an event with edge-trigger semantic for a particular GSI.
-    fn unregister_edge_irq_event(&mut self, irq: u32, irq_event: &IrqEdgeEvent) -> Result<()> {
+    fn unregister_edge_irq_event(&self, irq: u32, irq_event: &IrqEdgeEvent) -> Result<()> {
         self.vm.unregister_irqfd(irq, irq_event.get_trigger())
     }
 
     /// Register an event with level-trigger semantic that can trigger an interrupt
     /// for a particular GSI.
     fn register_level_irq_event(
-        &mut self,
+        &self,
         irq: u32,
         irq_event: &IrqLevelEvent,
         _source: IrqEventSource,
@@ -183,12 +163,12 @@ impl IrqChip for HallaKernelIrqChip {
     }
 
     /// Unregister an event with level-trigger semantic for a particular GSI.
-    fn unregister_level_irq_event(&mut self, irq: u32, irq_event: &IrqLevelEvent) -> Result<()> {
+    fn unregister_level_irq_event(&self, irq: u32, irq_event: &IrqLevelEvent) -> Result<()> {
         self.vm.unregister_irqfd(irq, irq_event.get_trigger())
     }
 
     /// Route an IRQ line to an interrupt controller, or to a particular MSI vector.
-    fn route_irq(&mut self, route: IrqRoute) -> Result<()> {
+    fn route_irq(&self, route: IrqRoute) -> Result<()> {
         let mut routes = self.routes.lock();
         routes.retain(|r| r.gsi != route.gsi);
 
@@ -197,7 +177,7 @@ impl IrqChip for HallaKernelIrqChip {
     }
 
     /// Replace all irq routes with the supplied routes
-    fn set_irq_routes(&mut self, routes: &[IrqRoute]) -> Result<()> {
+    fn set_irq_routes(&self, routes: &[IrqRoute]) -> Result<()> {
         let mut current_routes = self.routes.lock();
         *current_routes = routes.to_vec();
         Ok(())
@@ -214,7 +194,7 @@ impl IrqChip for HallaKernelIrqChip {
     /// Either assert or deassert an IRQ line.  Sends to either an interrupt controller, or does
     /// a send_msi if the irq is associated with an MSI.
     /// For the HallaKernelIrqChip this simply calls the HVM_SET_IRQ_LINE ioctl.
-    fn service_irq(&mut self, irq: u32, level: bool) -> Result<()> {
+    fn service_irq(&self, irq: u32, level: bool) -> Result<()> {
         self.vm.set_irq_line(irq, level)
     }
 
@@ -223,7 +203,7 @@ impl IrqChip for HallaKernelIrqChip {
     /// Event, then the deassert will only happen after an EOI is broadcast for a vector
     /// associated with the irq line.
     /// This function should never be called on HallaKernelIrqChip.
-    fn service_irq_event(&mut self, _event_index: IrqEventIndex) -> Result<()> {
+    fn service_irq_event(&self, _event_index: IrqEventIndex) -> Result<()> {
         error!("service_irq_event should never be called for HallaKernelIrqChip");
         Ok(())
     }
@@ -266,22 +246,15 @@ impl IrqChip for HallaKernelIrqChip {
     }
 
     /// Set the current MP state of the specified VCPU.
-    fn set_mp_state(&mut self, _vcpu_id: usize, _state: &MPState) -> Result<()> {
+    fn set_mp_state(&self, _vcpu_id: usize, _state: &MPState) -> Result<()> {
         Err(Error::new(libc::ENOENT))
-    }
-
-    /// Attempt to clone this IrqChip instance.
-    fn try_clone(&self) -> Result<Self> {
-        // Because the HallaKernelIrqChip struct contains arch-specific fields we leave the
-        // cloning to arch-specific implementations
-        self.arch_try_clone()
     }
 
     /// Finalize irqchip setup. Should be called once all devices have registered irq events and
     /// been added to the io_bus and mmio_bus.
     /// HallaKernelIrqChip does not need to do anything here.
     fn finalize_devices(
-        &mut self,
+        self: Arc<Self>,
         _resources: &mut SystemAllocator,
         _io_bus: &Bus,
         _mmio_bus: &Bus,
@@ -290,7 +263,7 @@ impl IrqChip for HallaKernelIrqChip {
     }
 
     /// The HallaKernelIrqChip doesn't process irq events itself so this function does nothing.
-    fn process_delayed_irq_events(&mut self) -> Result<()> {
+    fn process_delayed_irq_events(&self) -> Result<()> {
         Ok(())
     }
 

@@ -895,7 +895,7 @@ fn create_devices(
 #[derive(Debug)]
 struct PvClockError(String);
 
-fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
+fn handle_readable_event(
     event: &TriggeredEvent<Token>,
     vm_control_ids_to_remove: &mut Vec<usize>,
     next_control_id: &mut usize,
@@ -905,7 +905,7 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     #[cfg(feature = "gpu")] gpu_control_tube: Option<&Tube>,
     vm_evt_rdtube: &RecvTube,
     control_tubes: &mut BTreeMap<usize, TaggedControlTube>,
-    guest_os: &mut RunnableLinuxVm<V, Vcpu>,
+    guest_os: &mut RunnableLinuxVm,
     sys_allocator_mutex: &Arc<Mutex<SystemAllocator>>,
     virtio_snd_host_mute_tubes: &mut [Tube],
     proto_main_loop_tube: Option<&ProtoTube>,
@@ -924,7 +924,7 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     vcpu_control_channels: &[mpsc::Sender<VcpuControl>],
     suspended_pvclock_state: &mut Option<hypervisor::ClockState>,
 ) -> Result<Option<ExitState>> {
-    let mut execute_vm_request = |request: VmRequest, guest_os: &mut RunnableLinuxVm<V, Vcpu>| {
+    let mut execute_vm_request = |request: VmRequest, guest_os: &mut RunnableLinuxVm| {
         if let VmRequest::Exit = request {
             return (VmResponse::Ok, Some(VmRunMode::Exiting));
         }
@@ -1162,9 +1162,9 @@ fn handle_readable_event<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
 ///
 /// Returns the exit state, if it changed due to a run mode change.
 /// None otherwise.
-fn handle_run_mode_change_for_vm_request<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
+fn handle_run_mode_change_for_vm_request(
     run_mode_opt: &Option<VmRunMode>,
-    guest_os: &mut RunnableLinuxVm<V, Vcpu>,
+    guest_os: &mut RunnableLinuxVm,
 ) -> Option<ExitState> {
     if let Some(run_mode) = run_mode_opt {
         info!("control socket changed run mode to {}", run_mode);
@@ -1186,7 +1186,7 @@ pub enum VmMemoryHandlerRequest {
 
 fn vm_memory_handler_thread(
     control_tubes: Vec<Tube>,
-    vm: Arc<impl Vm>,
+    vm: Arc<dyn Vm>,
     sys_allocator_mutex: Arc<Mutex<SystemAllocator>>,
     mut gralloc: RutabagaGralloc,
     handler_control: Tube,
@@ -1301,8 +1301,8 @@ fn create_control_server(
     Ok::<Option<ControlServer>, anyhow::Error>(None)
 }
 
-fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
-    mut guest_os: RunnableLinuxVm<V, Vcpu>,
+fn run_control(
+    mut guest_os: RunnableLinuxVm,
     sys_allocator: SystemAllocator,
     control_tubes: Vec<TaggedControlTube>,
     irq_control_tubes: Vec<Tube>,
@@ -1352,10 +1352,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // us avoid approaching the Windows WaitForMultipleObjects 64-object limit.
     let irq_join_handle = IrqWaitWorker::start(
         irq_handler_control_for_worker,
-        guest_os
-            .irq_chip
-            .try_box_clone()
-            .exit_context(Exit::CloneEvent, "failed to clone irq chip")?,
+        guest_os.irq_chip.clone(),
         irq_control_tubes,
         sys_allocator_mutex.clone(),
     );
@@ -1520,12 +1517,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             &irq_handler_control,
             &device_ctrl_tube,
             guest_os.vcpu_count,
-            |image| {
-                guest_os
-                    .irq_chip
-                    .try_box_clone()?
-                    .restore(image, guest_os.vcpu_count)
-            },
+            |image| guest_os.irq_chip.restore(image, guest_os.vcpu_count),
             /* require_encrypted= */ false,
             &mut suspended_pvclock_state,
             &*guest_os.vm,
@@ -1952,7 +1944,6 @@ fn create_whpx_vm(
     no_smt: bool,
     apic_emulation: bool,
     force_calibrated_tsc_leaf: bool,
-    vm_evt_wrtube: SendTube,
 ) -> Result<Arc<WhpxVm>> {
     let cpu_config = hypervisor::CpuConfigX86_64::new(
         force_calibrated_tsc_leaf,
@@ -1982,15 +1973,8 @@ fn create_whpx_vm(
         adjust_cpuid(entry, &ctx);
     }
 
-    let vm = WhpxVm::new(
-        &whpx,
-        cpu_count,
-        mem,
-        cpuid,
-        apic_emulation,
-        Some(vm_evt_wrtube),
-    )
-    .exit_context(Exit::WhpxSetupError, "failed to create WHPX vm")?;
+    let vm = WhpxVm::new(&whpx, cpu_count, mem, cpuid, apic_emulation)
+        .exit_context(Exit::WhpxSetupError, "failed to create WHPX vm")?;
 
     Ok(Arc::new(vm))
 }
@@ -2016,13 +2000,10 @@ fn create_whpx_split_irq_chip(
     )
 }
 
-fn create_userspace_irq_chip<Vcpu>(
+fn create_userspace_irq_chip(
     vcpu_count: usize,
     ioapic_device_tube: Tube,
-) -> base::Result<UserspaceIrqChip<Vcpu>>
-where
-    Vcpu: VcpuArch + 'static,
-{
+) -> base::Result<UserspaceIrqChip> {
     info!("Creating userspace irqchip");
     let irq_chip =
         UserspaceIrqChip::new(vcpu_count, ioapic_device_tube, /* ioapic_pins: */ None)?;
@@ -2173,28 +2154,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         break_linux_pci_config_io: cfg.break_linux_pci_config_io,
         boot_cpu: cfg.boot_cpu,
     })
-}
-
-// Enum that allows us to assign a variable to what is essentially a &dyn IrqChipArch.
-enum WindowsIrqChip<V: VcpuArch> {
-    Userspace(UserspaceIrqChip<V>),
-    #[cfg(feature = "gvm")]
-    Gvm(GvmIrqChip),
-    #[cfg(feature = "whpx")]
-    WhpxSplit(WhpxSplitIrqChip),
-}
-
-impl<V: VcpuArch> WindowsIrqChip<V> {
-    // Convert our enum to a &mut dyn IrqChipArch
-    fn as_mut(&mut self) -> &mut dyn IrqChipArch {
-        match self {
-            WindowsIrqChip::Userspace(i) => i,
-            #[cfg(feature = "gvm")]
-            WindowsIrqChip::Gvm(i) => i,
-            #[cfg(feature = "whpx")]
-            WindowsIrqChip::WhpxSplit(i) => i,
-        }
-    }
 }
 
 /// Storage for the VM TSC offset for each vcpu. Stored in a static because the tracing thread will
@@ -2392,16 +2351,14 @@ fn run_config_inner(
             let vm = Arc::new(create_haxm_vm(haxm, guest_mem, &cfg.kernel_log_file)?);
             let (ioapic_host_tube, ioapic_device_tube) =
                 Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-            let irq_chip = create_userspace_irq_chip::<HaxmVcpu>(
-                components.vcpu_properties.len(),
-                ioapic_device_tube,
-            )?;
-            run_vm::<HaxmVcpu, HaxmVm>(
+            let irq_chip =
+                create_userspace_irq_chip(components.vcpu_properties.len(), ioapic_device_tube)?;
+            run_vm(
                 cfg,
                 components,
                 &arch_memory_layout,
                 vm,
-                WindowsIrqChip::Userspace(irq_chip).as_mut(),
+                Arc::new(irq_chip),
                 Some(ioapic_host_tube),
                 vm_evt_wrtube,
                 vm_evt_rdtube,
@@ -2436,12 +2393,9 @@ fn run_config_inner(
                 no_smt,
                 apic_emulation_supported && irq_chip == IrqChipKind::Split,
                 cfg.force_calibrated_tsc_leaf,
-                vm_evt_wrtube
-                    .try_clone()
-                    .expect("could not clone vm_evt_wrtube"),
             )?;
 
-            let mut irq_chip = match irq_chip {
+            let irq_chip: Arc<dyn IrqChipArch> = match irq_chip {
                 IrqChipKind::Kernel {} => {
                     unimplemented!("Kernel irqchip mode not supported by WHPX")
                 }
@@ -2452,24 +2406,19 @@ fn run_config_inner(
                                local apic emulation"
                         );
                     }
-                    WindowsIrqChip::WhpxSplit(create_whpx_split_irq_chip(
-                        vm.clone(),
-                        ioapic_device_tube,
-                    )?)
+                    Arc::new(create_whpx_split_irq_chip(vm.clone(), ioapic_device_tube)?)
                 }
-                IrqChipKind::Userspace => {
-                    WindowsIrqChip::Userspace(create_userspace_irq_chip::<WhpxVcpu>(
-                        components.vcpu_properties.len(),
-                        ioapic_device_tube,
-                    )?)
-                }
+                IrqChipKind::Userspace => Arc::new(create_userspace_irq_chip(
+                    components.vcpu_properties.len(),
+                    ioapic_device_tube,
+                )?),
             };
-            run_vm::<WhpxVcpu, WhpxVm>(
+            run_vm(
                 cfg,
                 components,
                 &arch_memory_layout,
                 vm,
-                irq_chip.as_mut(),
+                irq_chip,
                 Some(ioapic_host_tube),
                 vm_evt_wrtube,
                 vm_evt_rdtube,
@@ -2482,28 +2431,28 @@ fn run_config_inner(
             let guest_mem = create_guest_memory(&components, &arch_memory_layout, &gvm)?;
             let vm = create_gvm_vm(gvm, guest_mem)?;
             let ioapic_host_tube;
-            let mut irq_chip = match cfg.irq_chip.unwrap_or(IrqChipKind::Kernel) {
+            let irq_chip: Arc<dyn IrqChipArch> = match cfg.irq_chip.unwrap_or(IrqChipKind::Kernel) {
                 IrqChipKind::Split => unimplemented!("Split irqchip mode not supported by GVM"),
                 IrqChipKind::Kernel => {
                     ioapic_host_tube = None;
-                    WindowsIrqChip::Gvm(create_gvm_irq_chip(&vm, components.vcpu_properties.len())?)
+                    Arc::new(create_gvm_irq_chip(&vm, components.vcpu_properties.len())?)
                 }
                 IrqChipKind::Userspace => {
                     let (host_tube, ioapic_device_tube) =
                         Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
                     ioapic_host_tube = Some(host_tube);
-                    WindowsIrqChip::Userspace(create_userspace_irq_chip::<GvmVcpu>(
+                    Arc::new(create_userspace_irq_chip(
                         components.vcpu_properties.len(),
                         ioapic_device_tube,
                     )?)
                 }
             };
-            run_vm::<GvmVcpu, GvmVm>(
+            run_vm(
                 cfg,
                 components,
                 &arch_memory_layout,
                 vm,
-                irq_chip.as_mut(),
+                irq_chip.into_arc(),
                 ioapic_host_tube,
                 vm_evt_wrtube,
                 vm_evt_rdtube,
@@ -2513,20 +2462,16 @@ fn run_config_inner(
 }
 
 #[cfg(any(feature = "haxm", feature = "gvm", feature = "whpx"))]
-fn run_vm<Vcpu, V>(
+fn run_vm(
     #[allow(unused_mut)] mut cfg: Config,
     #[allow(unused_mut)] mut components: VmComponents,
     arch_memory_layout: &<Arch as LinuxArch>::ArchMemoryLayout,
-    vm: Arc<V>,
-    irq_chip: &mut dyn IrqChipArch,
+    vm: Arc<dyn VmArch>,
+    irq_chip: Arc<dyn IrqChipArch>,
     ioapic_host_tube: Option<Tube>,
     vm_evt_wrtube: SendTube,
     vm_evt_rdtube: RecvTube,
-) -> Result<ExitState>
-where
-    Vcpu: VcpuArch + 'static,
-    V: VmArch + 'static,
-{
+) -> Result<ExitState> {
     let vm_memory_size_mb = components.memory_size / (1024 * 1024);
     let mut control_tubes = Vec::new();
     let mut irq_control_tubes = Vec::new();
@@ -2706,7 +2651,7 @@ where
     let mut vcpu_ids = Vec::new();
 
     let (vwmdt_host_tube, vmwdt_device_tube) = Tube::pair().context("failed to create tube")?;
-    let windows = Arch::build_vm::<V, Vcpu>(
+    let windows = Arch::build_vm(
         components,
         arch_memory_layout,
         &vm_evt_wrtube,
@@ -2717,7 +2662,7 @@ where
         vm,
         ramoops_region,
         pci_devices,
-        irq_chip,
+        irq_chip.clone(),
         &mut vcpu_ids,
         cfg.dump_device_tree_blob.clone(),
         /* debugcon_jail= */ None,

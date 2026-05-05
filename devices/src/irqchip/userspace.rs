@@ -7,6 +7,8 @@ use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Display;
 use std::iter;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 cfg_if::cfg_if! {
@@ -92,9 +94,9 @@ const X86_CR0_INIT: u64 = X86_CR0_ET | X86_CR0_NW | X86_CR0_CD;
 
 /// An `IrqChip` with all interrupt devices emulated in userspace.  `UserspaceIrqChip` works with
 /// any hypervisor, but only supports x86.
-pub struct UserspaceIrqChip<V: VcpuX86_64> {
-    pub vcpus: Arc<Mutex<Vec<Option<Arc<V>>>>>,
-    routes: Arc<Mutex<Routes>>,
+pub struct UserspaceIrqChip {
+    pub vcpus: Arc<Mutex<Vec<Option<Arc<dyn VcpuX86_64>>>>>,
+    routes: Mutex<Routes>,
     pit: Arc<Mutex<Pit>>,
     pic: Arc<Mutex<Pic>>,
     ioapic: Arc<Mutex<Ioapic>>,
@@ -113,22 +115,15 @@ pub struct UserspaceIrqChip<V: VcpuX86_64> {
     /// This lock may be locked by itself to access the `DelayedIoApicIrqEvents`. If accessed in
     /// conjunction with the `irq_events` field, that lock should be taken first to prevent
     /// deadlocks stemming from lock-ordering issues.
-    delayed_ioapic_irq_events: Arc<Mutex<DelayedIoApicIrqEvents>>,
+    delayed_ioapic_irq_events: Mutex<DelayedIoApicIrqEvents>,
     // Array of Events that devices will use to assert ioapic pins.
-    irq_events: Arc<Mutex<Vec<Option<IrqEvent>>>>,
-    dropper: Arc<Mutex<Dropper>>,
-    activated: bool,
-}
-
-/// Helper that implements `Drop` on behalf of `UserspaceIrqChip`.  The many cloned copies of an irq
-/// chip share a single arc'ed `Dropper`, which only runs its drop when the last irq chip copy is
-/// dropped.
-struct Dropper {
+    irq_events: Mutex<Vec<Option<IrqEvent>>>,
     /// Worker threads that deliver timer events to the APICs.
-    workers: Vec<WorkerThread<()>>,
+    workers: Mutex<Vec<WorkerThread<()>>>,
+    activated: AtomicBool,
 }
 
-impl<V: VcpuX86_64 + 'static> UserspaceIrqChip<V> {
+impl UserspaceIrqChip {
     /// Constructs a new `UserspaceIrqChip`.
     pub fn new(num_vcpus: usize, irq_tube: Tube, ioapic_pins: Option<usize>) -> Result<Self> {
         let clock = Arc::new(Mutex::new(Clock::new()));
@@ -178,28 +173,25 @@ impl<V: VcpuX86_64 + 'static> UserspaceIrqChip<V> {
             let apic = Apic::new(id, Box::new(timer));
             apics.push(Arc::new(Mutex::new(apic)));
         }
-        let dropper = Dropper {
-            workers: Vec::new(),
-        };
 
-        let mut chip = UserspaceIrqChip {
+        let chip = UserspaceIrqChip {
             vcpus: Arc::new(Mutex::new(
                 iter::repeat_with(|| None).take(num_vcpus).collect(),
             )),
             waiters: iter::repeat_with(Default::default)
                 .take(num_vcpus)
                 .collect(),
-            routes: Arc::new(Mutex::new(Routes::new())),
+            routes: Mutex::new(Routes::new()),
             pit: Arc::new(Mutex::new(pit)),
             pic: Arc::new(Mutex::new(Pic::new())),
             ioapic: Arc::new(Mutex::new(ioapic)),
             ioapic_pins,
             apics,
             timer_descriptors,
-            delayed_ioapic_irq_events: Arc::new(Mutex::new(DelayedIoApicIrqEvents::new()?)),
-            irq_events: Arc::new(Mutex::new(Vec::new())),
-            dropper: Arc::new(Mutex::new(dropper)),
-            activated: false,
+            delayed_ioapic_irq_events: Mutex::new(DelayedIoApicIrqEvents::new()?),
+            irq_events: Mutex::new(Vec::new()),
+            workers: Mutex::new(Vec::new()),
+            activated: AtomicBool::new(false),
         };
 
         // Setup standard x86 irq routes
@@ -309,7 +301,7 @@ impl<V: VcpuX86_64 + 'static> UserspaceIrqChip<V> {
     }
 
     /// Delivers a startup IPI to `vcpu`.
-    fn deliver_startup(&self, vcpu: &V, vector: u8) -> Result<()> {
+    fn deliver_startup(&self, vcpu: &dyn VcpuX86_64, vector: u8) -> Result<()> {
         // This comes from Intel SDM volume 3, chapter 8.4.  The vector specifies a page aligned
         // address where execution should start.  cs.base is the offset for the code segment with an
         // RIP of 0.  The cs.selector is just the base shifted right by 4 bits.
@@ -337,18 +329,32 @@ impl<V: VcpuX86_64 + 'static> UserspaceIrqChip<V> {
     }
 }
 
-impl Dropper {
-    fn sleep(&mut self) -> anyhow::Result<()> {
-        for thread in self.workers.split_off(0).into_iter() {
-            thread.stop();
+impl UserspaceIrqChip {
+    pub fn wake_internal(&self) -> anyhow::Result<()> {
+        if self.activated.load(Ordering::Relaxed) {
+            // create workers and run them.
+            for (i, descriptor) in self.timer_descriptors.iter().enumerate() {
+                let mut worker = TimerWorker {
+                    id: i,
+                    apic: self.apics[i].clone(),
+                    descriptor: *descriptor,
+                    vcpus: self.vcpus.clone(),
+                    waiter: self.waiters[i].clone(),
+                };
+                let worker_thread =
+                    WorkerThread::start(format!("UserspaceIrqChip timer worker {i}"), move |evt| {
+                        if let Err(e) = worker.run(evt) {
+                            error!("UserspaceIrqChip worker failed: {e:#}");
+                        }
+                    });
+                self.workers.lock().push(worker_thread);
+            }
         }
         Ok(())
     }
-}
 
-impl<V: VcpuX86_64 + 'static> UserspaceIrqChip<V> {
     fn register_irq_event(
-        &mut self,
+        &self,
         irq: u32,
         irq_event: &Event,
         resample_event: Option<&Event>,
@@ -370,7 +376,7 @@ impl<V: VcpuX86_64 + 'static> UserspaceIrqChip<V> {
         Ok(Some(index))
     }
 
-    fn unregister_irq_event(&mut self, irq: u32, irq_event: &Event) -> Result<()> {
+    fn unregister_irq_event(&self, irq: u32, irq_event: &Event) -> Result<()> {
         let mut irq_events = self.irq_events.lock();
         for (index, evt) in irq_events.iter().enumerate() {
             if let Some(evt) = evt {
@@ -384,17 +390,14 @@ impl<V: VcpuX86_64 + 'static> UserspaceIrqChip<V> {
     }
 }
 
-impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
-    fn add_vcpu(&mut self, vcpu_id: usize, vcpu: Arc<dyn VcpuArch>) -> Result<()> {
-        let vcpu = Arc::downcast(vcpu)
-            .map_err(|_| ())
-            .expect("UserspaceIrqChip::add_vcpu called with incorrect vcpu type");
+impl IrqChip for UserspaceIrqChip {
+    fn add_vcpu(&self, vcpu_id: usize, vcpu: Arc<dyn VcpuArch>) -> Result<()> {
         self.vcpus.lock()[vcpu_id] = Some(vcpu);
         Ok(())
     }
 
     fn register_edge_irq_event(
-        &mut self,
+        &self,
         irq: u32,
         irq_event: &IrqEdgeEvent,
         source: IrqEventSource,
@@ -402,12 +405,12 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
         self.register_irq_event(irq, irq_event.get_trigger(), None, source)
     }
 
-    fn unregister_edge_irq_event(&mut self, irq: u32, irq_event: &IrqEdgeEvent) -> Result<()> {
+    fn unregister_edge_irq_event(&self, irq: u32, irq_event: &IrqEdgeEvent) -> Result<()> {
         self.unregister_irq_event(irq, irq_event.get_trigger())
     }
 
     fn register_level_irq_event(
-        &mut self,
+        &self,
         irq: u32,
         irq_event: &IrqLevelEvent,
         source: IrqEventSource,
@@ -420,15 +423,15 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
         )
     }
 
-    fn unregister_level_irq_event(&mut self, irq: u32, irq_event: &IrqLevelEvent) -> Result<()> {
+    fn unregister_level_irq_event(&self, irq: u32, irq_event: &IrqLevelEvent) -> Result<()> {
         self.unregister_irq_event(irq, irq_event.get_trigger())
     }
 
-    fn route_irq(&mut self, route: IrqRoute) -> Result<()> {
+    fn route_irq(&self, route: IrqRoute) -> Result<()> {
         self.routes.lock().add(route)
     }
 
-    fn set_irq_routes(&mut self, routes: &[IrqRoute]) -> Result<()> {
+    fn set_irq_routes(&self, routes: &[IrqRoute]) -> Result<()> {
         self.routes.lock().replace_all(routes)
     }
 
@@ -442,7 +445,7 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
         Ok(tokens)
     }
 
-    fn service_irq(&mut self, irq: u32, level: bool) -> Result<()> {
+    fn service_irq(&self, irq: u32, level: bool) -> Result<()> {
         for route in self.routes.lock()[irq as usize].iter() {
             match *route {
                 IrqSource::Irqchip {
@@ -484,7 +487,7 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
     /// delayed_ioapic_irq_events (though we still read from the Event that triggered the irq
     /// event).  If it's an MSI route, we call send_msi to decode the MSI and send it to the
     /// destination APIC(s).
-    fn service_irq_event(&mut self, event_index: IrqEventIndex) -> Result<()> {
+    fn service_irq_event(&self, event_index: IrqEventIndex) -> Result<()> {
         let irq_events = self.irq_events.lock();
         let evt = if let Some(evt) = &irq_events[event_index] {
             evt
@@ -555,9 +558,6 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
     ///   * Handles APIC SIPIs
     ///   * Requests an interrupt window, if PIC or APIC still has pending interrupts for this vcpu
     fn inject_interrupts(&self, vcpu: &dyn VcpuArch) -> Result<()> {
-        let vcpu: &V = vcpu
-            .downcast_ref()
-            .expect("UserspaceIrqChip::add_vcpu called with incorrect vcpu type");
         let vcpu_id = vcpu.id();
         let mut vcpu_ready = vcpu.ready_for_interrupt();
 
@@ -681,35 +681,14 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
         Ok(self.apics[vcpu_id].lock().get_mp_state())
     }
 
-    fn set_mp_state(&mut self, vcpu_id: usize, state: &MPState) -> Result<()> {
+    fn set_mp_state(&self, vcpu_id: usize, state: &MPState) -> Result<()> {
         self.apics[vcpu_id].lock().set_mp_state(state);
         Ok(())
     }
 
-    fn try_clone(&self) -> Result<Self> {
-        // kill_evts and timer_descriptors don't change, so they could be a plain Vec with each
-        // element cloned.  But the Arc<Mutex> avoids a quadratic number of open descriptors from
-        // cloning, and those fields aren't performance critical.
-        Ok(UserspaceIrqChip {
-            vcpus: self.vcpus.clone(),
-            waiters: self.waiters.clone(),
-            routes: self.routes.clone(),
-            pit: self.pit.clone(),
-            pic: self.pic.clone(),
-            ioapic: self.ioapic.clone(),
-            ioapic_pins: self.ioapic_pins,
-            apics: self.apics.clone(),
-            timer_descriptors: self.timer_descriptors.clone(),
-            delayed_ioapic_irq_events: self.delayed_ioapic_irq_events.clone(),
-            irq_events: self.irq_events.clone(),
-            dropper: self.dropper.clone(),
-            activated: self.activated,
-        })
-    }
-
     // TODO(srichman): factor out UserspaceIrqChip and KvmSplitIrqChip::finalize_devices
     fn finalize_devices(
-        &mut self,
+        self: Arc<Self>,
         resources: &mut SystemAllocator,
         io_bus: &Bus,
         mmio_bus: &Bus,
@@ -734,11 +713,7 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
 
         // Insert self into mmio_bus for handling APIC mmio
         mmio_bus
-            .insert_sync(
-                Arc::new(self.try_clone()?),
-                APIC_BASE_ADDRESS,
-                APIC_MEM_LENGTH_BYTES,
-            )
+            .insert_sync(self.clone(), APIC_BASE_ADDRESS, APIC_MEM_LENGTH_BYTES)
             .unwrap();
 
         // At this point, all of our devices have been created and they have registered their
@@ -774,8 +749,8 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
         }
 
         // Spawn timer threads here instead of in new(), in case crosvm is in sandbox mode.
-        self.activated = true;
-        let _ = self.wake();
+        self.activated.store(true, Ordering::Relaxed);
+        let _ = self.wake_internal();
 
         Ok(())
     }
@@ -787,7 +762,7 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
     /// not be immediately locked are added to the delayed_ioapic_irq_events Vec. This function
     /// processes each delayed event in the vec each time it's called. If the ioapic is still
     /// locked, we keep the queued irqs for the next time this function is called.
-    fn process_delayed_irq_events(&mut self) -> Result<()> {
+    fn process_delayed_irq_events(&self) -> Result<()> {
         let irq_events = self.irq_events.lock();
         let mut delayed_events = self.delayed_ioapic_irq_events.lock();
         delayed_events.events.retain(|&event_index| {
@@ -830,7 +805,7 @@ impl<V: VcpuX86_64 + 'static> IrqChip for UserspaceIrqChip<V> {
     }
 }
 
-impl<V: VcpuX86_64 + 'static> BusDevice for UserspaceIrqChip<V> {
+impl BusDevice for UserspaceIrqChip {
     fn debug_label(&self) -> String {
         "UserspaceIrqChip APIC".to_string()
     }
@@ -839,38 +814,22 @@ impl<V: VcpuX86_64 + 'static> BusDevice for UserspaceIrqChip<V> {
     }
 }
 
-impl<V: VcpuX86_64 + 'static> Suspendable for UserspaceIrqChip<V> {
+impl Suspendable for UserspaceIrqChip {
     fn sleep(&mut self) -> anyhow::Result<()> {
-        let mut dropper = self.dropper.lock();
-        dropper.sleep()
-    }
-
-    fn wake(&mut self) -> anyhow::Result<()> {
-        if self.activated {
-            // create workers and run them.
-            let mut dropper = self.dropper.lock();
-            for (i, descriptor) in self.timer_descriptors.iter().enumerate() {
-                let mut worker = TimerWorker {
-                    id: i,
-                    apic: self.apics[i].clone(),
-                    descriptor: *descriptor,
-                    vcpus: self.vcpus.clone(),
-                    waiter: self.waiters[i].clone(),
-                };
-                let worker_thread =
-                    WorkerThread::start(format!("UserspaceIrqChip timer worker {i}"), move |evt| {
-                        if let Err(e) = worker.run(evt) {
-                            error!("UserspaceIrqChip worker failed: {e:#}");
-                        }
-                    });
-                dropper.workers.push(worker_thread);
-            }
+        // TODO: This is never called because `UserspaceIrqChip` is a `BusDeviceSync`. We should be
+        // implementing `sleep_sync` and friends instead.
+        for thread in self.workers.lock().split_off(0).into_iter() {
+            thread.stop();
         }
         Ok(())
     }
+
+    fn wake(&mut self) -> anyhow::Result<()> {
+        self.wake_internal()
+    }
 }
 
-impl<V: VcpuX86_64 + 'static> BusDeviceSync for UserspaceIrqChip<V> {
+impl BusDeviceSync for UserspaceIrqChip {
     fn read(&self, info: BusAccessInfo, data: &mut [u8]) {
         self.apics[info.id].lock().read(info.offset, data)
     }
@@ -882,24 +841,12 @@ impl<V: VcpuX86_64 + 'static> BusDeviceSync for UserspaceIrqChip<V> {
     }
 }
 
-impl<V: VcpuX86_64 + 'static> IrqChipX86_64 for UserspaceIrqChip<V> {
-    fn try_box_clone(&self) -> Result<Box<dyn IrqChipX86_64>> {
-        Ok(Box::new(self.try_clone()?))
-    }
-
-    fn as_irq_chip(&self) -> &dyn IrqChip {
-        self
-    }
-
-    fn as_irq_chip_mut(&mut self) -> &mut dyn IrqChip {
-        self
-    }
-
+impl IrqChipX86_64 for UserspaceIrqChip {
     fn get_pic_state(&self, select: PicSelect) -> Result<PicState> {
         Ok(self.pic.lock().get_pic_state(select))
     }
 
-    fn set_pic_state(&mut self, select: PicSelect, state: &PicState) -> Result<()> {
+    fn set_pic_state(&self, select: PicSelect, state: &PicState) -> Result<()> {
         self.pic.lock().set_pic_state(select, state);
         Ok(())
     }
@@ -908,7 +855,7 @@ impl<V: VcpuX86_64 + 'static> IrqChipX86_64 for UserspaceIrqChip<V> {
         Ok(self.ioapic.lock().get_ioapic_state())
     }
 
-    fn set_ioapic_state(&mut self, state: &IoapicState) -> Result<()> {
+    fn set_ioapic_state(&self, state: &IoapicState) -> Result<()> {
         self.ioapic.lock().set_ioapic_state(state);
         Ok(())
     }
@@ -917,7 +864,7 @@ impl<V: VcpuX86_64 + 'static> IrqChipX86_64 for UserspaceIrqChip<V> {
         Ok(self.apics[vcpu_id].lock().get_state())
     }
 
-    fn set_lapic_state(&mut self, vcpu_id: usize, state: &LapicState) -> Result<()> {
+    fn set_lapic_state(&self, vcpu_id: usize, state: &LapicState) -> Result<()> {
         self.apics[vcpu_id].lock().set_state(state);
         Ok(())
     }
@@ -931,7 +878,7 @@ impl<V: VcpuX86_64 + 'static> IrqChipX86_64 for UserspaceIrqChip<V> {
         Ok(self.pit.lock().get_pit_state())
     }
 
-    fn set_pit(&mut self, state: &PitState) -> Result<()> {
+    fn set_pit(&self, state: &PitState) -> Result<()> {
         self.pit.lock().set_pit_state(state);
         Ok(())
     }
@@ -945,7 +892,7 @@ impl<V: VcpuX86_64 + 'static> IrqChipX86_64 for UserspaceIrqChip<V> {
     fn snapshot_chip_specific(&self) -> anyhow::Result<AnySnapshot> {
         Err(anyhow::anyhow!("Not supported yet in userspace"))
     }
-    fn restore_chip_specific(&mut self, _data: AnySnapshot) -> anyhow::Result<()> {
+    fn restore_chip_specific(&self, _data: AnySnapshot) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("Not supported yet in userspace"))
     }
 }
@@ -976,15 +923,15 @@ impl Waiter {
 }
 
 /// Worker thread for polling timer events and sending them to an APIC.
-struct TimerWorker<V: VcpuX86_64> {
+struct TimerWorker {
     id: usize,
     apic: Arc<Mutex<Apic>>,
-    vcpus: Arc<Mutex<Vec<Option<Arc<V>>>>>,
+    vcpus: Arc<Mutex<Vec<Option<Arc<dyn VcpuX86_64>>>>>,
     descriptor: Descriptor,
     waiter: Arc<Waiter>,
 }
 
-impl<V: VcpuX86_64> TimerWorker<V> {
+impl TimerWorker {
     fn run(&mut self, kill_evt: Event) -> TimerWorkerResult<()> {
         #[derive(EventToken)]
         enum Token {

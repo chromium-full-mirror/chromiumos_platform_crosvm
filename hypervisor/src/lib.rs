@@ -239,7 +239,7 @@ pub trait Vm: Send + Sync {
     /// triggered is prevented.
     fn register_ioevent(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()>;
@@ -250,7 +250,7 @@ pub trait Vm: Send + Sync {
     /// `register_ioevent`.
     fn unregister_ioevent(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()>;
@@ -394,10 +394,7 @@ pub(crate) trait VcpuSignalHandleInner {
 
 /// A virtual CPU holding a virtualized hardware thread's state, such as registers and interrupt
 /// state, which may be used to execute virtual machines.
-pub trait Vcpu: downcast_rs::DowncastSync {
-    /// Casts this architecture specific trait object to the base trait object `Vcpu`.
-    fn as_vcpu(&self) -> &dyn Vcpu;
-
+pub trait Vcpu: std::any::Any + Send + Sync {
     /// Runs the VCPU until it exits, returning the reason for the exit.
     fn run(&self) -> Result<VcpuExit>;
 
@@ -455,8 +452,6 @@ pub trait Vcpu: downcast_rs::DowncastSync {
     /// allocated as the kernel expects, and that mutable pointers are owned.
     unsafe fn enable_raw_capability(&self, cap: u32, args: &[u64; 4]) -> Result<()>;
 }
-
-downcast_rs::impl_downcast!(sync Vcpu);
 
 /// An address either in programmable I/O space or in memory mapped I/O space.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, std::hash::Hash)]

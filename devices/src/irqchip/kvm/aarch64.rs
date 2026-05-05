@@ -26,7 +26,6 @@ use snapshot::AnySnapshot;
 use sync::Mutex;
 
 use crate::icc_regs;
-use crate::IrqChip;
 use crate::IrqChipAArch64;
 
 /// Default ARM routing table.  AARCH64_GIC_NR_SPIS pins go to VGIC.
@@ -45,11 +44,11 @@ fn kvm_default_irq_routing_table() -> Vec<IrqRoute> {
 /// This implementation will use the KVM API to create and configure the in-kernel irqchip.
 pub struct KvmKernelIrqChip {
     pub(super) vm: Arc<KvmVm>,
-    pub(super) vcpus: Arc<Mutex<Vec<Option<Arc<KvmVcpu>>>>>,
+    pub(super) vcpus: Mutex<Vec<Option<Arc<KvmVcpu>>>>,
     vgic: SafeDescriptor,
     vgic_its: Option<SafeDescriptor>,
     device_kind: DeviceKind,
-    pub(super) routes: Arc<Mutex<Vec<IrqRoute>>>,
+    pub(super) routes: Mutex<Vec<IrqRoute>>,
 }
 
 // These constants indicate the address space used by the ARM vGIC.
@@ -173,44 +172,16 @@ impl KvmKernelIrqChip {
 
         Ok(KvmKernelIrqChip {
             vm,
-            vcpus: Arc::new(Mutex::new((0..num_vcpus).map(|_| None).collect())),
+            vcpus: Mutex::new((0..num_vcpus).map(|_| None).collect()),
             vgic,
             vgic_its,
             device_kind,
-            routes: Arc::new(Mutex::new(kvm_default_irq_routing_table())),
-        })
-    }
-
-    /// Attempt to create a shallow clone of this aarch64 KvmKernelIrqChip instance.
-    pub(super) fn arch_try_clone(&self) -> Result<Self> {
-        Ok(KvmKernelIrqChip {
-            vm: self.vm.clone(),
-            vcpus: self.vcpus.clone(),
-            vgic: self.vgic.try_clone()?,
-            vgic_its: self
-                .vgic_its
-                .as_ref()
-                .map(|fd| fd.try_clone())
-                .transpose()?,
-            device_kind: self.device_kind,
-            routes: self.routes.clone(),
+            routes: Mutex::new(kvm_default_irq_routing_table()),
         })
     }
 }
 
 impl IrqChipAArch64 for KvmKernelIrqChip {
-    fn try_box_clone(&self) -> Result<Box<dyn IrqChipAArch64>> {
-        Ok(Box::new(self.try_clone()?))
-    }
-
-    fn as_irq_chip(&self) -> &dyn IrqChip {
-        self
-    }
-
-    fn as_irq_chip_mut(&mut self) -> &mut dyn IrqChip {
-        self
-    }
-
     fn get_vgic_version(&self) -> DeviceKind {
         self.device_kind
     }
@@ -278,7 +249,7 @@ impl IrqChipAArch64 for KvmKernelIrqChip {
         }
     }
 
-    fn restore(&mut self, data: AnySnapshot, _vcpus_num: usize) -> anyhow::Result<()> {
+    fn restore(&self, data: AnySnapshot, _vcpus_num: usize) -> anyhow::Result<()> {
         if self.device_kind == DeviceKind::ArmVgicV3 {
             // SAVE_PENDING_TABLES operation wrote the pending tables into guest memory.
             let deser: VgicSnapshot =

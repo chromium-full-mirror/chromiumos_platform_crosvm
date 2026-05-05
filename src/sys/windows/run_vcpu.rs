@@ -105,8 +105,8 @@ impl VcpuRunMode {
     }
 }
 
-struct RunnableVcpuInfo<V> {
-    vcpu: Arc<V>,
+struct RunnableVcpuInfo {
+    vcpu: Arc<dyn VcpuArch>,
     thread_priority_handle: Option<SafeMultimediaHandle>,
 }
 
@@ -138,7 +138,7 @@ impl VcpuRunThread {
 
     /// Perform WHPX-specific vcpu configurations
     #[cfg(feature = "whpx")]
-    fn whpx_configure_vcpu(vcpu: &dyn VcpuArch, irq_chip: &mut dyn IrqChipArch) {
+    fn whpx_configure_vcpu(vcpu: &dyn VcpuArch, irq_chip: &dyn IrqChipArch) {
         // only apply to actual WhpxVcpu instances
         if let Some(whpx_vcpu) = (vcpu as &dyn std::any::Any).downcast_ref::<WhpxVcpu>() {
             // WhpxVcpu instances need to know the TSC and Lapic frequencies to handle Hyper-V MSR
@@ -157,32 +157,26 @@ impl VcpuRunThread {
     }
 
     // Sets up a vcpu and converts it into a runnable vcpu.
-    fn runnable_vcpu<V>(
+    fn runnable_vcpu(
         cpu_id: usize,
-        vcpu: Option<Arc<V>>,
+        vcpu: Option<Arc<dyn VcpuArch>>,
         vcpu_init: VcpuInitX86_64,
-        vm: &impl VmArch,
-        irq_chip: &mut dyn IrqChipArch,
+        vm: &dyn VmArch,
+        irq_chip: &dyn IrqChipArch,
         vcpu_count: usize,
         run_rt: bool,
         vcpu_affinity: Option<CpuSet>,
         no_smt: bool,
         host_cpu_topology: bool,
         force_calibrated_tsc_leaf: bool,
-    ) -> Result<RunnableVcpuInfo<V>>
-    where
-        V: VcpuArch,
-    {
+    ) -> Result<RunnableVcpuInfo> {
         let vcpu = match vcpu {
             Some(v) => v,
             None => {
                 // If vcpu is None, it means this arch/hypervisor requires create_vcpu to be called
                 // from the vcpu thread.
-                Arc::downcast(
-                    vm.create_vcpu(cpu_id)
-                        .exit_context(Exit::CreateVcpu, "failed to create vcpu")?,
-                )
-                .unwrap_or_else(|_| panic!("VM created wrong type of VCPU"))
+                vm.create_vcpu(cpu_id)
+                    .exit_context(Exit::CreateVcpu, "failed to create vcpu")?
             }
         };
 
@@ -244,13 +238,13 @@ impl VcpuRunThread {
         })
     }
 
-    pub fn run<V>(
+    pub fn run(
         &self,
-        vcpu: Option<Arc<V>>,
+        vcpu: Option<Arc<dyn VcpuArch>>,
         vcpu_init: VcpuInitX86_64,
         vcpus: Arc<Mutex<Vec<Arc<dyn VcpuArch>>>>,
-        vm: Arc<impl VmArch + 'static>,
-        mut irq_chip: Box<dyn IrqChipArch + 'static>,
+        vm: Arc<dyn VmArch>,
+        irq_chip: Arc<dyn IrqChipArch>,
         vcpu_count: usize,
         run_rt: bool,
         vcpu_affinity: Option<CpuSet>,
@@ -268,10 +262,7 @@ impl VcpuRunThread {
         tsc_offset: Option<u64>,
         force_calibrated_tsc_leaf: bool,
         vcpu_control: mpsc::Receiver<VcpuControl>,
-    ) -> Result<JoinHandle<Result<()>>>
-    where
-        V: VcpuArch + 'static,
-    {
+    ) -> Result<JoinHandle<Result<()>>> {
         let context = self.clone();
         thread::Builder::new()
             .name(format!("crosvm_vcpu{}", self.cpu_id))
@@ -285,7 +276,7 @@ impl VcpuRunThread {
                         vcpu,
                         vcpu_init,
                         &*vm,
-                        irq_chip.as_mut(),
+                        irq_chip.as_ref(),
                         vcpu_count,
                         run_rt && !delay_rt,
                         vcpu_affinity,
@@ -538,10 +529,10 @@ fn setup_vcpu_signal_handler() -> Result<()> {
     Ok(())
 }
 
-pub fn run_all_vcpus<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
-    vcpus: Vec<Option<Arc<Vcpu>>>,
+pub fn run_all_vcpus(
+    vcpus: Vec<Option<Arc<dyn VcpuArch>>>,
     vcpu_boxes: Arc<Mutex<Vec<Arc<dyn VcpuArch>>>>,
-    guest_os: &RunnableLinuxVm<V, Vcpu>,
+    guest_os: &RunnableLinuxVm,
     exit_evt: &Event,
     vm_evt_wrtube: &SendTube,
     #[cfg(feature = "stats")] stats: &Option<Arc<Mutex<StatisticsCollector>>>,
@@ -602,10 +593,7 @@ pub fn run_all_vcpus<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             vcpu_init.clone(),
             vcpu_boxes.clone(),
             guest_os.vm.clone(),
-            guest_os
-                .irq_chip
-                .try_box_clone()
-                .exit_context(Exit::CloneEvent, "failed to clone event")?,
+            guest_os.irq_chip.clone(),
             guest_os.vcpu_count,
             guest_os.rt_cpus.contains(&cpu_id),
             vcpu_affinity,
@@ -644,11 +632,11 @@ pub fn run_all_vcpus<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     Ok((vcpu_threads, vcpu_control_channels))
 }
 
-fn vcpu_loop<V>(
+fn vcpu_loop(
     context: &VcpuRunThread,
-    vcpu: Arc<V>,
-    vm: Arc<impl VmArch + 'static>,
-    irq_chip: Box<dyn IrqChipArch + 'static>,
+    vcpu: Arc<dyn VcpuArch>,
+    vm: Arc<dyn VmArch>,
+    irq_chip: Arc<dyn IrqChipArch>,
     io_bus: Bus,
     mmio_bus: Bus,
     hypercall_bus: Bus,
@@ -656,10 +644,7 @@ fn vcpu_loop<V>(
     #[cfg(feature = "stats")] stats: Option<Arc<Mutex<StatisticsCollector>>>,
     #[cfg(target_arch = "x86_64")] cpuid_context: CpuIdContext,
     vcpu_control: mpsc::Receiver<VcpuControl>,
-) -> Result<ExitState>
-where
-    V: VcpuArch + 'static,
-{
+) -> Result<ExitState> {
     #[cfg(feature = "stats")]
     let mut exit_stats = VmExitStatistics::new();
 
@@ -944,13 +929,11 @@ where
     }
 }
 
-fn process_vcpu_control_messages<V>(
-    vcpu: &V,
+fn process_vcpu_control_messages(
+    vcpu: &dyn VcpuArch,
     run_mode: VmRunMode,
     vcpu_control: &mpsc::Receiver<VcpuControl>,
-) where
-    V: VcpuArch + 'static,
-{
+) {
     let control_messages: Vec<VcpuControl> = vcpu_control.try_iter().collect();
 
     for msg in control_messages {

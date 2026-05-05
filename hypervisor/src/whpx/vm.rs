@@ -25,7 +25,6 @@ use base::Protection;
 use base::RawDescriptor;
 use base::Result;
 use base::SafeDescriptor;
-use base::SendTube;
 use fnv::FnvHashMap;
 use libc::EEXIST;
 use libc::EFAULT;
@@ -89,7 +88,6 @@ impl WhpxVm {
         guest_mem: GuestMemory,
         cpuid: CpuId,
         apic_emulation: bool,
-        _vm_evt_wrtube: Option<SendTube>,
     ) -> WhpxResult<WhpxVm> {
         let partition = SafePartition::new()?;
         // setup partition defaults.
@@ -627,7 +625,7 @@ impl Vm for WhpxVm {
 
     fn register_ioevent(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()> {
@@ -635,8 +633,6 @@ impl Vm for WhpxVm {
             error!("WHPX currently only supports Datamatch::AnyLength");
             return Err(Error::new(ENOTSUP));
         }
-
-        let evt = evt.try_clone()?;
 
         let mut ioevents = self.ioevents.write().unwrap();
 
@@ -652,7 +648,7 @@ impl Vm for WhpxVm {
 
     fn unregister_ioevent(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()> {
@@ -666,7 +662,7 @@ impl Vm for WhpxVm {
         match ioevents.get(&addr) {
             Some(existing_evt) => {
                 // evt should match the existing evt associated with addr
-                if evt != existing_evt {
+                if evt != *existing_evt {
                     return Err(Error::new(ENOENT));
                 }
                 ioevents.remove(&addr);
@@ -796,15 +792,8 @@ mod tests {
         let whpx = Whpx::new().expect("failed to instantiate whpx");
         let local_apic_supported = Whpx::check_whpx_feature(WhpxFeature::LocalApicEmulation)
             .expect("failed to get whpx features");
-        WhpxVm::new(
-            &whpx,
-            cpu_count,
-            mem,
-            CpuId::new(0),
-            local_apic_supported,
-            None,
-        )
-        .expect("failed to create whpx vm")
+        WhpxVm::new(&whpx, cpu_count, mem, CpuId::new(0), local_apic_supported)
+            .expect("failed to create whpx vm")
     }
 
     #[test]
@@ -880,20 +869,28 @@ mod tests {
         let vm = new_vm(cpu_count, mem);
         let evt = Event::new().expect("failed to create event");
         let otherevt = Event::new().expect("failed to create event");
-        vm.register_ioevent(&evt, IoEventAddress::Pio(0xf4), Datamatch::AnyLength)
-            .unwrap();
-        vm.register_ioevent(&evt, IoEventAddress::Mmio(0x1000), Datamatch::AnyLength)
-            .unwrap();
+        vm.register_ioevent(
+            evt.try_clone().unwrap(),
+            IoEventAddress::Pio(0xf4),
+            Datamatch::AnyLength,
+        )
+        .unwrap();
+        vm.register_ioevent(
+            evt.try_clone().unwrap(),
+            IoEventAddress::Mmio(0x1000),
+            Datamatch::AnyLength,
+        )
+        .unwrap();
 
         vm.register_ioevent(
-            &otherevt,
+            otherevt.try_clone().unwrap(),
             IoEventAddress::Mmio(0x1000),
             Datamatch::AnyLength,
         )
         .expect_err("WHPX should not allow you to register two events for the same address");
 
         vm.register_ioevent(
-            &otherevt,
+            otherevt.try_clone().unwrap(),
             IoEventAddress::Mmio(0x1000),
             Datamatch::U8(None),
         )
@@ -902,7 +899,7 @@ mod tests {
         );
 
         vm.register_ioevent(
-            &otherevt,
+            otherevt.try_clone().unwrap(),
             IoEventAddress::Mmio(0x1000),
             Datamatch::U32(Some(0xf6)),
         )
@@ -910,17 +907,33 @@ mod tests {
             "WHPX should not allow you to register ioevents with Datamatches other than AnyLength",
         );
 
-        vm.unregister_ioevent(&otherevt, IoEventAddress::Pio(0xf4), Datamatch::AnyLength)
+        vm.unregister_ioevent(otherevt, IoEventAddress::Pio(0xf4), Datamatch::AnyLength)
             .expect_err("unregistering an unknown event should fail");
-        vm.unregister_ioevent(&evt, IoEventAddress::Pio(0xf5), Datamatch::AnyLength)
-            .expect_err("unregistering an unknown PIO address should fail");
-        vm.unregister_ioevent(&evt, IoEventAddress::Pio(0x1000), Datamatch::AnyLength)
-            .expect_err("unregistering an unknown PIO address should fail");
-        vm.unregister_ioevent(&evt, IoEventAddress::Mmio(0xf4), Datamatch::AnyLength)
-            .expect_err("unregistering an unknown MMIO address should fail");
-        vm.unregister_ioevent(&evt, IoEventAddress::Pio(0xf4), Datamatch::AnyLength)
-            .unwrap();
-        vm.unregister_ioevent(&evt, IoEventAddress::Mmio(0x1000), Datamatch::AnyLength)
+        vm.unregister_ioevent(
+            evt.try_clone().unwrap(),
+            IoEventAddress::Pio(0xf5),
+            Datamatch::AnyLength,
+        )
+        .expect_err("unregistering an unknown PIO address should fail");
+        vm.unregister_ioevent(
+            evt.try_clone().unwrap(),
+            IoEventAddress::Pio(0x1000),
+            Datamatch::AnyLength,
+        )
+        .expect_err("unregistering an unknown PIO address should fail");
+        vm.unregister_ioevent(
+            evt.try_clone().unwrap(),
+            IoEventAddress::Mmio(0xf4),
+            Datamatch::AnyLength,
+        )
+        .expect_err("unregistering an unknown MMIO address should fail");
+        vm.unregister_ioevent(
+            evt.try_clone().unwrap(),
+            IoEventAddress::Pio(0xf4),
+            Datamatch::AnyLength,
+        )
+        .unwrap();
+        vm.unregister_ioevent(evt, IoEventAddress::Mmio(0x1000), Datamatch::AnyLength)
             .unwrap();
     }
 
@@ -935,10 +948,18 @@ mod tests {
         let vm = new_vm(cpu_count, mem);
         let evt = Event::new().expect("failed to create event");
         let evt2 = Event::new().expect("failed to create event");
-        vm.register_ioevent(&evt, IoEventAddress::Pio(0x1000), Datamatch::AnyLength)
-            .unwrap();
-        vm.register_ioevent(&evt2, IoEventAddress::Mmio(0x1000), Datamatch::AnyLength)
-            .unwrap();
+        vm.register_ioevent(
+            evt.try_clone().unwrap(),
+            IoEventAddress::Pio(0x1000),
+            Datamatch::AnyLength,
+        )
+        .unwrap();
+        vm.register_ioevent(
+            evt2.try_clone().unwrap(),
+            IoEventAddress::Mmio(0x1000),
+            Datamatch::AnyLength,
+        )
+        .unwrap();
 
         // Check a pio address
         vm.handle_io_events(IoEventAddress::Pio(0x1000), &[])

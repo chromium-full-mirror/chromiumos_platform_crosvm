@@ -25,15 +25,6 @@ use snapshot::AnySnapshot;
 use crate::IrqChip;
 
 pub trait IrqChipAArch64: IrqChip {
-    // Clones this trait as a `Box` version of itself.
-    fn try_box_clone(&self) -> Result<Box<dyn IrqChipAArch64>>;
-
-    // Get this as the super-trait IrqChip.
-    fn as_irq_chip(&self) -> &dyn IrqChip;
-
-    // Get this as the mutable super-trait IrqChip.
-    fn as_irq_chip_mut(&mut self) -> &mut dyn IrqChip;
-
     /// Get the version of VGIC that this chip is emulating. Currently KVM may either implement
     /// VGIC version 2 or 3.
     fn get_vgic_version(&self) -> DeviceKind;
@@ -49,7 +40,7 @@ pub trait IrqChipAArch64: IrqChip {
         Err(anyhow!("Snapshot not yet implemented for AArch64"))
     }
 
-    fn restore(&mut self, _data: AnySnapshot, _vcpus_num: usize) -> anyhow::Result<()> {
+    fn restore(&self, _data: AnySnapshot, _vcpus_num: usize) -> anyhow::Result<()> {
         Err(anyhow!("Restore not yet implemented for AArch64"))
     }
 }

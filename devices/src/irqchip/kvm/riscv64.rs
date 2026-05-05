@@ -19,7 +19,6 @@ use hypervisor::Vm;
 use kvm_sys::*;
 use sync::Mutex;
 
-use crate::IrqChip;
 use crate::IrqChipRiscv64;
 
 const RISCV_IRQCHIP: u64 = 0x0800_0000;
@@ -67,10 +66,6 @@ const KVM_DEV_RISCV_AIA_GRP_CTRL: u32 = 2;
 struct AiaDescriptor(SafeDescriptor);
 
 impl AiaDescriptor {
-    fn try_clone(&self) -> Result<AiaDescriptor> {
-        self.0.try_clone().map(AiaDescriptor)
-    }
-
     fn aia_init(&self) -> Result<()> {
         let init_attr = kvm_device_attr {
             group: KVM_DEV_RISCV_AIA_GRP_CTRL,
@@ -207,13 +202,12 @@ impl AsRawDescriptor for AiaDescriptor {
 /// This implementation will use the KVM API to create and configure the in-kernel irqchip.
 pub struct KvmKernelIrqChip {
     pub(super) vm: Arc<KvmVm>,
-    pub(super) vcpus: Arc<Mutex<Vec<Option<Arc<KvmVcpu>>>>>,
+    pub(super) vcpus: Mutex<Vec<Option<Arc<KvmVcpu>>>>,
     num_vcpus: usize,
     num_ids: usize,     // number of imsics ids
     num_sources: usize, // number of aplic sources
     aia: AiaDescriptor,
-    device_kind: DeviceKind,
-    pub(super) routes: Arc<Mutex<Vec<IrqRoute>>>,
+    pub(super) routes: Mutex<Vec<IrqRoute>>,
 }
 
 impl KvmKernelIrqChip {
@@ -241,47 +235,17 @@ impl KvmKernelIrqChip {
 
         Ok(KvmKernelIrqChip {
             vm,
-            vcpus: Arc::new(Mutex::new((0..num_vcpus).map(|_| None).collect())),
+            vcpus: Mutex::new((0..num_vcpus).map(|_| None).collect()),
             num_vcpus,
             num_ids: num_ids as usize,
             num_sources: NUM_SOURCES as usize,
             aia,
-            device_kind: DeviceKind::RiscvAia,
-            routes: Arc::new(Mutex::new(kvm_default_irq_routing_table(
-                NUM_SOURCES as usize,
-            ))),
-        })
-    }
-
-    /// Attempt to create a shallow clone of this riscv64 KvmKernelIrqChip instance.
-    /// This is the arch-specific impl used by `KvmKernelIrqChip::clone()`.
-    pub(super) fn arch_try_clone(&self) -> Result<Self> {
-        Ok(KvmKernelIrqChip {
-            vm: self.vm.clone(),
-            vcpus: self.vcpus.clone(),
-            num_vcpus: self.num_vcpus,
-            num_ids: self.num_ids,
-            num_sources: self.num_sources,
-            aia: self.aia.try_clone()?,
-            device_kind: self.device_kind,
-            routes: self.routes.clone(),
+            routes: Mutex::new(kvm_default_irq_routing_table(NUM_SOURCES as usize)),
         })
     }
 }
 
 impl IrqChipRiscv64 for KvmKernelIrqChip {
-    fn try_box_clone(&self) -> Result<Box<dyn IrqChipRiscv64>> {
-        Ok(Box::new(self.try_clone()?))
-    }
-
-    fn as_irq_chip(&self) -> &dyn IrqChip {
-        self
-    }
-
-    fn as_irq_chip_mut(&mut self) -> &mut dyn IrqChip {
-        self
-    }
-
     fn finalize(&self) -> Result<()> {
         // The kernel needs the number of vcpus finalized before setting up the address for each
         // interrupt controller.

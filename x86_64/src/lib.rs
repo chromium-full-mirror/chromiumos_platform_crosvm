@@ -63,6 +63,7 @@ use arch::CpuSet;
 use arch::DtbOverlay;
 use arch::FdtPosition;
 use arch::GetSerialCmdlineError;
+use arch::IrqChipArch;
 use arch::MemoryRegionConfig;
 use arch::PciConfig;
 use arch::RunnableLinuxVm;
@@ -1024,8 +1025,8 @@ impl arch::LinuxArch for X8664arch {
         ))
     }
 
-    fn get_system_allocator_config<V: Vm>(
-        vm: &V,
+    fn get_system_allocator_config(
+        vm: &dyn Vm,
         arch_memory_layout: &Self::ArchMemoryLayout,
     ) -> SystemAllocatorConfig {
         SystemAllocatorConfig {
@@ -1040,7 +1041,7 @@ impl arch::LinuxArch for X8664arch {
         }
     }
 
-    fn build_vm<V, Vcpu>(
+    fn build_vm(
         mut components: VmComponents,
         arch_memory_layout: &Self::ArchMemoryLayout,
         vm_evt_wrtube: &SendTube,
@@ -1048,10 +1049,10 @@ impl arch::LinuxArch for X8664arch {
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,
         battery: (Option<BatteryType>, Option<Minijail>),
-        vm: Arc<V>,
+        vm: Arc<dyn VmX86_64>,
         ramoops_region: Option<arch::pstore::RamoopsRegion>,
         devs: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
-        irq_chip: &mut dyn IrqChipX86_64,
+        irq_chip: Arc<dyn IrqChipX86_64>,
         vcpu_ids: &mut Vec<usize>,
         dump_device_tree_blob: Option<PathBuf>,
         debugcon_jail: Option<Minijail>,
@@ -1062,11 +1063,7 @@ impl arch::LinuxArch for X8664arch {
         device_tree_overlays: Vec<DtbOverlay>,
         _fdt_position: Option<FdtPosition>,
         _no_pmu: bool,
-    ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
-    where
-        V: VmX86_64,
-        Vcpu: VcpuX86_64,
-    {
+    ) -> std::result::Result<RunnableLinuxVm, Self::Error> {
         let mem = vm.get_memory().clone();
 
         let vcpu_count = components.vcpu_properties.len();
@@ -1115,7 +1112,7 @@ impl arch::LinuxArch for X8664arch {
 
         let (pci, pci_irqs, pid_debug_label_map, amls, gpe_scope_amls) = arch::generate_pci_root(
             pci_devices,
-            irq_chip.as_irq_chip_mut(),
+            &*irq_chip,
             mmio_bus.clone(),
             GuestAddress(pcie_cfg_mmio_range.start),
             12,
@@ -1184,7 +1181,7 @@ impl arch::LinuxArch for X8664arch {
             Self::setup_legacy_cmos_device(
                 arch_memory_layout,
                 &io_bus,
-                irq_chip,
+                irq_chip.clone(),
                 device_tube,
                 components.memory_size,
             )
@@ -1195,7 +1192,7 @@ impl arch::LinuxArch for X8664arch {
         };
         let serial_devices = Self::setup_serial_devices(
             components.hv_cfg.protection_type,
-            irq_chip.as_irq_chip_mut(),
+            &*irq_chip,
             &io_bus,
             serial_parameters,
             serial_jail,
@@ -1245,7 +1242,7 @@ impl arch::LinuxArch for X8664arch {
             suspend_tube_send.clone(),
             vm_evt_wrtube.try_clone().map_err(Error::CloneTube)?,
             components.acpi_sdts,
-            irq_chip.as_irq_chip_mut(),
+            &*irq_chip,
             sci_irq,
             battery,
             &mmio_bus,
@@ -1266,6 +1263,7 @@ impl arch::LinuxArch for X8664arch {
         }
 
         irq_chip
+            .clone()
             .finalize_devices(system_allocator, &io_bus, &mmio_bus)
             .map_err(Error::RegisterIrqfd)?;
 
@@ -1481,7 +1479,7 @@ impl arch::LinuxArch for X8664arch {
             vcpu_affinity: components.vcpu_affinity,
             vcpu_init,
             no_smt: components.no_smt,
-            irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
+            irq_chip,
             hypercall_bus,
             io_bus,
             mmio_bus,
@@ -1501,10 +1499,10 @@ impl arch::LinuxArch for X8664arch {
         })
     }
 
-    fn configure_vcpu<V: Vm>(
-        vm: &V,
+    fn configure_vcpu(
+        vm: &dyn Vm,
         hypervisor: &dyn HypervisorX86_64,
-        irq_chip: &mut dyn IrqChipX86_64,
+        irq_chip: &dyn IrqChipX86_64,
         vcpu: &dyn VcpuX86_64,
         vcpu_init: VcpuInitX86_64,
         vcpu_id: usize,
@@ -1554,8 +1552,8 @@ impl arch::LinuxArch for X8664arch {
         Ok(())
     }
 
-    fn register_pci_device<V: VmX86_64, Vcpu: VcpuX86_64>(
-        linux: &mut RunnableLinuxVm<V, Vcpu>,
+    fn register_pci_device(
+        linux: &mut RunnableLinuxVm,
         device: Box<dyn PciDevice>,
         #[cfg(any(target_os = "android", target_os = "linux"))] minijail: Option<Minijail>,
         resources: &mut SystemAllocator,
@@ -2001,7 +1999,7 @@ impl X8664arch {
     }
 
     /// Returns the high mmio range
-    fn get_high_mmio_range<V: Vm>(vm: &V, arch_memory_layout: &ArchMemoryLayout) -> AddressRange {
+    fn get_high_mmio_range(vm: &dyn Vm, arch_memory_layout: &ArchMemoryLayout) -> AddressRange {
         let mem = vm.get_memory();
         let start = Self::get_pcie_vcfg_mmio_range(mem, &arch_memory_layout.pcie_cfg_mmio).end + 1;
 
@@ -2124,7 +2122,7 @@ impl X8664arch {
     pub fn setup_legacy_cmos_device(
         arch_memory_layout: &ArchMemoryLayout,
         io_bus: &Bus,
-        irq_chip: &mut dyn IrqChipX86_64,
+        irq_chip: Arc<dyn IrqChipArch>,
         vm_control: Tube,
         mem_size: u64,
     ) -> anyhow::Result<()> {
@@ -2189,7 +2187,7 @@ impl X8664arch {
         suspend_tube: Arc<Mutex<SendTube>>,
         vm_evt_wrtube: SendTube,
         sdts: Vec<SDT>,
-        irq_chip: &mut dyn IrqChip,
+        irq_chip: &dyn IrqChip,
         sci_irq: u32,
         battery: (Option<BatteryType>, Option<Minijail>),
         #[cfg_attr(windows, allow(unused_variables))] mmio_bus: &Bus,
@@ -2455,7 +2453,7 @@ impl X8664arch {
     /// * - `serial_parameters` - definitions for how the serial devices should be configured
     pub fn setup_serial_devices(
         protection_type: ProtectionType,
-        irq_chip: &mut dyn IrqChip,
+        irq_chip: &dyn IrqChip,
         io_bus: &Bus,
         serial_parameters: &BTreeMap<(SerialHardware, u8), SerialParameters>,
         serial_jail: Option<Minijail>,

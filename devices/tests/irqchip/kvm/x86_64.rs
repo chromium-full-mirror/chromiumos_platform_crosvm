@@ -45,14 +45,15 @@ use crate::x86_64::test_set_pic;
 use crate::x86_64::test_set_pit;
 
 /// Helper function for setting up a KvmKernelIrqChip
-fn get_kernel_chip() -> KvmKernelIrqChip {
+fn get_kernel_chip() -> Arc<KvmKernelIrqChip> {
     let kvm = Kvm::new().expect("failed to instantiate Kvm");
     let mem = GuestMemory::new(&[]).unwrap();
     let vm =
         Arc::new(KvmVm::new(&kvm, mem, Default::default()).expect("failed tso instantiate vm"));
 
-    let mut chip =
-        KvmKernelIrqChip::new(vm.clone(), 1).expect("failed to instantiate KvmKernelIrqChip");
+    let chip = Arc::new(
+        KvmKernelIrqChip::new(vm.clone(), 1).expect("failed to instantiate KvmKernelIrqChip"),
+    );
 
     let vcpu = vm.create_vcpu(0).expect("failed to instantiate vcpu");
     chip.add_vcpu(0, vcpu).expect("failed to add vcpu");
@@ -61,7 +62,7 @@ fn get_kernel_chip() -> KvmKernelIrqChip {
 }
 
 /// Helper function for setting up a KvmSplitIrqChip
-fn get_split_chip() -> KvmSplitIrqChip {
+fn get_split_chip() -> Arc<KvmSplitIrqChip> {
     let kvm = Kvm::new().expect("failed to instantiate Kvm");
     let mem = GuestMemory::new(&[]).unwrap();
     let vm =
@@ -69,12 +70,12 @@ fn get_split_chip() -> KvmSplitIrqChip {
 
     let (_, device_tube) = Tube::pair().expect("failed to create irq tube");
 
-    let mut chip = KvmSplitIrqChip::new(vm.clone(), 1, device_tube, None)
+    let chip = KvmSplitIrqChip::new(vm.clone(), 1, device_tube, None)
         .expect("failed to instantiate KvmKernelIrqChip");
 
     let vcpu = vm.create_vcpu(0).expect("failed to instantiate vcpu");
     chip.add_vcpu(0, vcpu).expect("failed to add vcpu");
-    chip
+    Arc::new(chip)
 }
 
 #[test]
@@ -171,7 +172,7 @@ fn split_irqchip_pit_uses_speaker_port() {
 
 #[test]
 fn split_irqchip_routes_conflict() {
-    let mut chip = get_split_chip();
+    let chip = get_split_chip();
     chip.route_irq(IrqRoute {
         gsi: 5,
         source: IrqSource::Msi {
@@ -193,7 +194,7 @@ fn split_irqchip_routes_conflict() {
 
 #[test]
 fn irq_event_tokens() {
-    let mut chip = get_split_chip();
+    let chip = get_split_chip();
     let tokens = chip
         .irq_event_tokens()
         .expect("could not get irq_event_tokens");
@@ -228,7 +229,7 @@ fn irq_event_tokens() {
 
 #[test]
 fn finalize_devices() {
-    let mut chip = get_split_chip();
+    let chip = get_split_chip();
 
     let mmio_bus = Bus::new(BusType::Mmio);
     let io_bus = Bus::new(BusType::Io);
@@ -268,7 +269,8 @@ fn finalize_devices() {
         .expect("register_irq_event should not return None");
 
     // Once we finalize devices, the pic/pit/ioapic should be attached to io and mmio busses
-    chip.finalize_devices(&mut resources, &io_bus, &mmio_bus)
+    chip.clone()
+        .finalize_devices(&mut resources, &io_bus, &mmio_bus)
         .expect("failed to finalize devices");
 
     // Should not be able to allocate an irq < 24 now
@@ -348,7 +350,7 @@ fn finalize_devices() {
 
 #[test]
 fn get_external_interrupt() {
-    let mut chip = get_split_chip();
+    let chip = get_split_chip();
     assert!(!chip.interrupt_requested(0));
 
     chip.service_irq(0, true).expect("failed to service irq");
@@ -367,7 +369,7 @@ fn get_external_interrupt() {
 
 #[test]
 fn broadcast_eoi() {
-    let mut chip = get_split_chip();
+    let chip = get_split_chip();
 
     let mmio_bus = Bus::new(BusType::Mmio);
     let io_bus = Bus::new(BusType::Io);
@@ -405,7 +407,8 @@ fn broadcast_eoi() {
         .expect("failed to register_level_irq_event");
 
     // Once we finalize devices, the pic/pit/ioapic should be attached to io and mmio busses
-    chip.finalize_devices(&mut resources, &io_bus, &mmio_bus)
+    chip.clone()
+        .finalize_devices(&mut resources, &io_bus, &mmio_bus)
         .expect("failed to finalize devices");
 
     // setup a ioapic redirection table entry 1 with a vector of 123

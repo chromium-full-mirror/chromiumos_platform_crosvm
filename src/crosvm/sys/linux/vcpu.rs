@@ -124,26 +124,22 @@ pub fn set_vcpu_thread_scheduling(
 }
 
 // Sets up a vcpu and converts it into a runnable vcpu.
-pub fn runnable_vcpu<V>(
+pub fn runnable_vcpu(
     cpu_id: usize,
     vcpu_id: usize,
-    vcpu: Option<Arc<V>>,
+    vcpu: Option<Arc<dyn VcpuArch>>,
     vcpu_init: VcpuInitArch,
-    vm: Arc<impl VmArch>,
-    irq_chip: &mut dyn IrqChipArch,
+    vm: Arc<dyn VmArch>,
+    irq_chip: &dyn IrqChipArch,
     vcpu_count: usize,
     cpu_config: Option<CpuConfigArch>,
-) -> Result<Arc<V>>
-where
-    V: VcpuArch,
-{
+) -> Result<Arc<dyn VcpuArch>> {
     let vcpu = match vcpu {
         Some(v) => v,
         None => {
             // If vcpu is None, it means this arch/hypervisor requires create_vcpu to be called from
             // the vcpu thread.
-            Arc::downcast(vm.create_vcpu(vcpu_id).context("failed to create vcpu")?)
-                .unwrap_or_else(|_| panic!("VM created wrong type of VCPU"))
+            vm.create_vcpu(vcpu_id).context("failed to create vcpu")?
         }
     };
 
@@ -212,11 +208,11 @@ pub fn remove_vcpu_signal_handler() -> Result<()> {
     clear_signal_handler(SIGRTMIN() + 0).context("error unregistering signal handler")
 }
 
-fn vcpu_loop<V>(
+fn vcpu_loop(
     mut run_mode: VmRunMode,
     cpu_id: usize,
-    vcpu: Arc<V>,
-    irq_chip: Box<dyn IrqChipArch + 'static>,
+    vcpu: Arc<dyn VcpuArch>,
+    irq_chip: Arc<dyn IrqChipArch>,
     run_rt: bool,
     delay_rt: bool,
     io_bus: Bus,
@@ -226,10 +222,7 @@ fn vcpu_loop<V>(
     #[cfg(feature = "gdb")] to_gdb_tube: Option<mpsc::Sender<VcpuDebugStatusMessage>>,
     #[cfg(feature = "gdb")] guest_mem: GuestMemory,
     #[cfg(target_arch = "x86_64")] bus_lock_ratelimit_ctrl: Arc<Mutex<Ratelimit>>,
-) -> ExitState
-where
-    V: VcpuArch,
-{
+) -> ExitState {
     let mut interrupted_by_signal = false;
 
     loop {
@@ -519,13 +512,13 @@ pub struct VcpuPidTid {
     pub thread_id: u32,
 }
 
-pub fn run_vcpu<V>(
+pub fn run_vcpu(
     cpu_id: usize,
     vcpu_id: usize,
-    vcpu: Option<Arc<V>>,
+    vcpu: Option<Arc<dyn VcpuArch>>,
     vcpu_init: VcpuInitArch,
-    vm: Arc<impl VmArch + 'static>,
-    mut irq_chip: Box<dyn IrqChipArch + 'static>,
+    vm: Arc<dyn VmArch>,
+    irq_chip: Arc<dyn IrqChipArch>,
     vcpu_count: usize,
     run_rt: bool,
     vcpu_affinity: CpuSet,
@@ -545,10 +538,7 @@ pub fn run_vcpu<V>(
     run_mode: VmRunMode,
     boost_uclamp: bool,
     vcpu_pid_tid_tube: mpsc::Sender<VcpuPidTid>,
-) -> Result<JoinHandle<()>>
-where
-    V: VcpuArch + 'static,
-{
+) -> Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("crosvm_vcpu{cpu_id}"))
         .spawn(move || {
@@ -586,7 +576,7 @@ where
                     vcpu,
                     vcpu_init,
                     vm,
-                    irq_chip.as_mut(),
+                    irq_chip.as_ref(),
                     vcpu_count,
                     cpu_config,
                 );
@@ -611,7 +601,7 @@ where
                     run_mode,
                     cpu_id,
                     vcpu,
-                    irq_chip,
+                    irq_chip.clone(),
                     run_rt,
                     delay_rt,
                     io_bus,

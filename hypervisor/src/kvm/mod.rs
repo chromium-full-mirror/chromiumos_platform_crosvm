@@ -482,7 +482,7 @@ impl KvmVm {
 
     fn ioeventfd(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
         deassign: bool,
@@ -857,7 +857,7 @@ impl Vm for KvmVm {
 
     fn register_ioevent(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()> {
@@ -866,7 +866,7 @@ impl Vm for KvmVm {
 
     fn unregister_ioevent(
         &self,
-        evt: &Event,
+        evt: Event,
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()> {
@@ -959,10 +959,6 @@ pub struct KvmVcpu {
 }
 
 impl Vcpu for KvmVcpu {
-    fn as_vcpu(&self) -> &dyn Vcpu {
-        self
-    }
-
     fn id(&self) -> usize {
         self.id
     }

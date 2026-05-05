@@ -488,10 +488,6 @@ impl WhpxVcpu {
 }
 
 impl Vcpu for WhpxVcpu {
-    fn as_vcpu(&self) -> &dyn Vcpu {
-        self
-    }
-
     /// Returns the vcpu id.
     fn id(&self) -> usize {
         self.index.try_into().unwrap()
@@ -1240,6 +1236,8 @@ fn get_msr_name(msr_index: u32) -> Option<WHV_REGISTER_NAME> {
 // run calls are tested with the integration tests since the full vcpu needs to be setup for it.
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+
     use vm_memory::GuestAddress;
     use vm_memory::GuestMemory;
 
@@ -1250,15 +1248,8 @@ mod tests {
         let whpx = Whpx::new().expect("failed to instantiate whpx");
         let local_apic_supported = Whpx::check_whpx_feature(WhpxFeature::LocalApicEmulation)
             .expect("failed to get whpx features");
-        WhpxVm::new(
-            &whpx,
-            cpu_count,
-            mem,
-            CpuId::new(0),
-            local_apic_supported,
-            None,
-        )
-        .expect("failed to create whpx vm")
+        WhpxVm::new(&whpx, cpu_count, mem, CpuId::new(0), local_apic_supported)
+            .expect("failed to create whpx vm")
     }
 
     #[test]
@@ -1271,10 +1262,10 @@ mod tests {
             GuestMemory::new(&[(GuestAddress(0), 0x1000)]).expect("failed to create guest memory");
         let vm = new_vm(cpu_count, mem);
         let mut vcpu = vm.create_vcpu(0).expect("failed to create vcpu");
-        let vcpu0: &WhpxVcpu = vcpu.downcast_ref().expect("Expected a WhpxVcpu");
+        let vcpu0: &WhpxVcpu = <dyn Any>::downcast_ref(&*vcpu).expect("Expected a WhpxVcpu");
         assert_eq!(vcpu0.index, 0);
         vcpu = vm.create_vcpu(1).expect("failed to create vcpu");
-        let vcpu1: &WhpxVcpu = vcpu.downcast_ref().expect("Expected a WhpxVcpu");
+        let vcpu1: &WhpxVcpu = <dyn Any>::downcast_ref(&*vcpu).expect("Expected a WhpxVcpu");
         assert_eq!(vcpu1.index, 1);
     }
 
