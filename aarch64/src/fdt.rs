@@ -17,8 +17,6 @@ use arch::fdt::ReservedMemoryRegion;
 use arch::serial::SerialDeviceInfo;
 use arch::CpuSet;
 use arch::DtbOverlay;
-#[cfg(any(target_os = "android", target_os = "linux"))]
-use arch::PlatformBusResources;
 use base::open_file_or_duplicate;
 use cros_fdt::Error;
 use cros_fdt::Fdt;
@@ -29,6 +27,7 @@ use devices::pl030::PL030_AMBA_ID;
 use devices::IommuDevType;
 use devices::PciAddress;
 use devices::PciInterruptPin;
+use devices::PlatformBusResources;
 use hypervisor::PsciVersion;
 use hypervisor::PSCI_0_2;
 use hypervisor::PSCI_1_0;
@@ -631,9 +630,7 @@ pub fn create_fdt(
     pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
     pci_cfg: PciConfigRegion,
     pci_ranges: &[PciRange],
-    #[cfg(any(target_os = "android", target_os = "linux"))] platform_dev_resources: Vec<
-        PlatformBusResources,
-    >,
+    platform_dev_resources: Vec<PlatformBusResources>,
     num_vcpus: u32,
     cpu_mpidr_generator: &impl Fn(usize) -> Option<u64>,
     vcpu_clusters: Vec<CpuSet>,
@@ -679,6 +676,15 @@ pub fn create_fdt(
     create_memory_node(&mut fdt, guest_mem)?;
 
     let dma_pool_phandle = if let Some((swiotlb_addr, swiotlb_size)) = swiotlb {
+        // Some guests require this to be at least as big as their page size. Since we don't detect
+        // the guest page size right now, set it to 64k as a catch all. Note that the size is
+        // always in MBs, so the extra alignment is unlikely to have a negative effect.
+        let alignment = 64 * 1024;
+        assert!(swiotlb_size % alignment == 0);
+        if let Some(swiotlb_addr) = swiotlb_addr {
+            assert!(swiotlb_addr.0 % alignment == 0);
+        }
+
         let phandle = PHANDLE_RESTRICTED_DMA_POOL;
         reserved_memory_regions.push(ReservedMemoryRegion {
             address: swiotlb_addr,
@@ -686,7 +692,7 @@ pub fn create_fdt(
             phandle: Some(phandle),
             name: "restricted_dma_reserved",
             compatible: Some("restricted-dma-pool"),
-            alignment: Some(base::pagesize() as u64),
+            alignment: Some(alignment),
             no_map: false,
         });
         phandles.insert("restricted_dma_reserved", phandle);
@@ -763,10 +769,8 @@ pub fn create_fdt(
     // Done writing base FDT, now apply DT overlays
     apply_device_tree_overlays(
         &mut fdt,
-        device_tree_overlays,
-        #[cfg(any(target_os = "android", target_os = "linux"))]
-        platform_dev_resources,
-        #[cfg(any(target_os = "android", target_os = "linux"))]
+        &device_tree_overlays,
+        &platform_dev_resources,
         &phandles,
     )?;
 
