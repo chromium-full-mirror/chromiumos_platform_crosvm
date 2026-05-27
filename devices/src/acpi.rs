@@ -29,14 +29,12 @@ use snapshot::AnySnapshot;
 use sync::Mutex;
 use thiserror::Error;
 use vm_control::DeviceId;
-use vm_control::GpeNotify;
 use vm_control::PlatformDeviceId;
 use vm_control::PmResource;
 use vm_control::PmeNotify;
 use vm_control::VmRequest;
 use vm_control::VmResponse;
 
-use crate::ac_adapter::AcAdapter;
 use crate::pci::pm::PmConfig;
 use crate::BusAccessInfo;
 use crate::BusDevice;
@@ -52,10 +50,6 @@ pub enum ACPIPMError {
     /// Error while waiting for events.
     #[error("failed to wait for events: {0}")]
     WaitError(SysError),
-    #[error("Did not find group_id corresponding to acpi_mc_group")]
-    AcpiMcGroupError,
-    #[error("Failed to create and bind NETLINK_GENERIC socket for acpi_mc_group: {0}")]
-    AcpiEventSockError(base::Error),
     #[error("GPE {0} is out of bound")]
     GpeOutOfBound(u32),
 }
@@ -90,8 +84,6 @@ struct Pm1ResourceSerializable {
 pub(crate) struct GpeResource {
     pub(crate) status: [u8; ACPIPM_RESOURCE_GPE0_BLK_LEN as usize / 2],
     enable: [u8; ACPIPM_RESOURCE_GPE0_BLK_LEN as usize / 2],
-    #[serde(skip_serializing)]
-    pub(crate) gpe_notify: BTreeMap<u32, Vec<Arc<Mutex<dyn GpeNotify>>>>,
     // For each triggered GPE, a vector of events to check when resampling
     // sci_evt. If any events are un-signaled, then sci_evt should be re-asserted.
     #[serde(skip_serializing)]
@@ -131,8 +123,6 @@ pub struct ACPIPMResource {
     gpe0: Arc<Mutex<GpeResource>>,
     #[serde(serialize_with = "serialize_arc_mutex")]
     pci: Arc<Mutex<PciResource>>,
-    #[serde(skip_serializing)]
-    acdc: Option<Arc<Mutex<AcAdapter>>>,
 }
 
 #[derive(Deserialize)]
@@ -148,7 +138,6 @@ impl ACPIPMResource {
         sci_evt: IrqLevelEvent,
         suspend_tube: Arc<Mutex<SendTube>>,
         exit_evt_wrtube: SendTube,
-        acdc: Option<Arc<Mutex<AcAdapter>>>,
     ) -> ACPIPMResource {
         let pm1 = Pm1Resource {
             status: 0,
@@ -160,7 +149,6 @@ impl ACPIPMResource {
         let gpe0 = GpeResource {
             status: Default::default(),
             enable: Default::default(),
-            gpe_notify: BTreeMap::new(),
             pending_clear_evts: BTreeMap::new(),
             suspend_tube: suspend_tube.clone(),
         };
@@ -176,7 +164,6 @@ impl ACPIPMResource {
             pm1: Arc::new(Mutex::new(pm1)),
             gpe0: Arc::new(Mutex::new(gpe0)),
             pci: Arc::new(Mutex::new(pci)),
-            acdc,
         }
     }
 
@@ -184,12 +171,9 @@ impl ACPIPMResource {
         let sci_evt = self.sci_evt.try_clone().expect("failed to clone event");
         let pm1 = self.pm1.clone();
         let gpe0 = self.gpe0.clone();
-        let acdc = self.acdc.clone();
-
-        let acpi_event_ignored_gpe = Vec::new();
 
         self.worker_thread = Some(WorkerThread::start("ACPI PM worker", move |kill_evt| {
-            if let Err(e) = run_worker(sci_evt, kill_evt, pm1, gpe0, acpi_event_ignored_gpe, acdc) {
+            if let Err(e) = run_worker(sci_evt, kill_evt, pm1, gpe0) {
                 error!("{}", e);
             }
         }));
@@ -240,13 +224,9 @@ fn run_worker(
     kill_evt: Event,
     pm1: Arc<Mutex<Pm1Resource>>,
     gpe0: Arc<Mutex<GpeResource>>,
-    acpi_event_ignored_gpe: Vec<u32>,
-    arced_ac_adapter: Option<Arc<Mutex<AcAdapter>>>,
 ) -> Result<(), ACPIPMError> {
-    let acpi_event_sock = crate::sys::get_acpi_event_sock()?;
     #[derive(EventToken)]
     enum Token {
-        AcpiEvent,
         InterruptResample,
         Kill,
     }
@@ -256,25 +236,11 @@ fn run_worker(
         (&kill_evt, Token::Kill),
     ])
     .map_err(ACPIPMError::CreateWaitContext)?;
-    if let Some(acpi_event_sock) = &acpi_event_sock {
-        wait_ctx
-            .add(acpi_event_sock, Token::AcpiEvent)
-            .map_err(ACPIPMError::CreateWaitContext)?;
-    }
 
     loop {
         let events = wait_ctx.wait().map_err(ACPIPMError::WaitError)?;
         for event in events.iter().filter(|e| e.is_readable) {
             match event.token {
-                Token::AcpiEvent => {
-                    crate::sys::acpi_event_run(
-                        &sci_evt,
-                        &acpi_event_sock,
-                        &gpe0,
-                        &acpi_event_ignored_gpe,
-                        &arced_ac_adapter,
-                    );
-                }
                 Token::InterruptResample => {
                     sci_evt.clear_resample();
 
@@ -492,16 +458,6 @@ impl PmResource for ACPIPMResource {
         if let Some(root_ports) = pci.pme_notify.get_mut(&bus) {
             for root_port in root_ports {
                 root_port.lock().notify(requester_id);
-            }
-        }
-    }
-
-    fn register_gpe_notify_dev(&mut self, gpe: u32, notify_dev: Arc<Mutex<dyn GpeNotify>>) {
-        let mut gpe0 = self.gpe0.lock();
-        match gpe0.gpe_notify.get_mut(&gpe) {
-            Some(v) => v.push(notify_dev),
-            None => {
-                gpe0.gpe_notify.insert(gpe, vec![notify_dev]);
             }
         }
     }
@@ -806,7 +762,6 @@ mod tests {
             get_irq_evt(),
             Arc::new(Mutex::new(get_send_tube())),
             get_send_tube(),
-            None,
         ),
         modify_device
     );
