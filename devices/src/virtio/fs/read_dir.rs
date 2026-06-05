@@ -3,10 +3,12 @@
 // found in the LICENSE file.
 
 use std::ffi::CStr;
+use std::ffi::OsStr;
 use std::io;
 use std::mem::size_of;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::os::unix::ffi::OsStrExt;
 
 use base::AsRawDescriptor;
 use fuse::filesystem::DirEntry;
@@ -15,6 +17,8 @@ use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
+
+use crate::virtio::fs::allowlist::ReadDirFilter;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -29,6 +33,14 @@ pub struct ReadDir<P> {
     buf: P,
     current: usize,
     end: usize,
+    filter: Option<ReadDirFilter>,
+}
+
+impl<P> ReadDir<P> {
+    pub fn with_filter(mut self, filter: ReadDirFilter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
 }
 
 impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
@@ -59,6 +71,7 @@ impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
             buf,
             current: 0,
             end: res as usize,
+            filter: None,
         })
     }
 }
@@ -72,33 +85,54 @@ impl<P> ReadDir<P> {
 
 impl<P: Deref<Target = [u8]>> DirectoryIterator for ReadDir<P> {
     fn next(&mut self) -> Option<DirEntry> {
-        let rem = &self.buf[self.current..self.end];
-        if rem.is_empty() {
-            return None;
+        loop {
+            let rem = &self.buf[self.current..self.end];
+            if rem.is_empty() {
+                return None;
+            }
+
+            let (dirent64, back) = LinuxDirent64::read_from_prefix(rem)
+                .expect("unable to get LinuxDirent64 from slice");
+
+            let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
+            debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
+
+            let name = strip_padding(&back[..namelen]);
+            let entry = DirEntry {
+                ino: dirent64.d_ino,
+                offset: dirent64.d_off as u64,
+                type_: dirent64.d_ty as u32,
+                name,
+            };
+
+            debug_assert!(
+                rem.len() >= dirent64.d_reclen as usize,
+                "rem is smaller than `d_reclen`"
+            );
+            self.current += dirent64.d_reclen as usize;
+
+            // Apply dynamic path allowlist filtering.
+            if let Some(filter) = &self.filter {
+                match filter {
+                    ReadDirFilter::AllowAll => {}
+                    ReadDirFilter::DenyAll => {
+                        continue;
+                    }
+                    ReadDirFilter::AllowOnly(allowed_entries) => {
+                        let name_bytes = entry.name.to_bytes();
+                        if name_bytes != b"." && name_bytes != b".." {
+                            let name_os = OsStr::from_bytes(name_bytes);
+                            if !allowed_entries.contains(name_os) {
+                                // Skip this entry and check the next one (hide from guest)
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return Some(entry);
         }
-
-        let (dirent64, back) =
-            LinuxDirent64::read_from_prefix(rem).expect("unable to get LinuxDirent64 from slice");
-
-        let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
-        debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
-
-        // The kernel will pad the name with additional nul bytes until it is 8-byte aligned so
-        // we need to strip those off here.
-        let name = strip_padding(&back[..namelen]);
-        let entry = DirEntry {
-            ino: dirent64.d_ino,
-            offset: dirent64.d_off as u64,
-            type_: dirent64.d_ty as u32,
-            name,
-        };
-
-        debug_assert!(
-            rem.len() >= dirent64.d_reclen as usize,
-            "rem is smaller than `d_reclen`"
-        );
-        self.current += dirent64.d_reclen as usize;
-        Some(entry)
     }
 }
 
