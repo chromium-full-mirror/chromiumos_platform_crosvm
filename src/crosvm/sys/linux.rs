@@ -1634,6 +1634,8 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         smccc_trng: cfg.smccc_trng,
         #[cfg(target_arch = "aarch64")]
         sve_config: cfg.sve.unwrap_or_default(),
+        #[cfg(target_arch = "aarch64")]
+        nested: cfg.nested.mode,
     })
 }
 
@@ -4034,6 +4036,7 @@ fn run_control(
             cfg.no_smt,
             cfg.itmt,
             vcpu_hybrid_type,
+            cfg.nested.mode,
         ));
         #[cfg(target_arch = "x86_64")]
         let bus_lock_ratelimit_ctrl = Arc::clone(&bus_lock_ratelimit_ctrl);
