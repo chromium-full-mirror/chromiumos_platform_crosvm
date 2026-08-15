@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#![cfg(any(target_os = "android", target_os = "linux"))]
+
 use std::collections::BTreeMap;
 use std::io;
 use std::io::Read;
@@ -16,15 +18,23 @@ use base::EventToken;
 use base::RawDescriptor;
 use base::WaitContext;
 use base::WorkerThread;
+use devices::virtio;
+use devices::virtio::DescriptorChain;
+use devices::virtio::DeviceType;
+use devices::virtio::Interrupt;
+use devices::virtio::Queue;
+use devices::virtio::VirtioDevice;
+use devices::VirtioDeviceArgs;
+use devices::VirtioDeviceModule;
+use jail::JailConfig;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use minijail::Minijail;
 use remain::sorted;
 use thiserror::Error;
 use vm_memory::GuestMemory;
 
-use super::DescriptorChain;
-use super::DeviceType;
-use super::Interrupt;
-use super::Queue;
-use super::VirtioDevice;
+mod vtpm_proxy;
+pub use self::vtpm_proxy::VtpmProxy;
 
 // A single queue of size 2. The guest kernel driver will enqueue a single
 // descriptor chain containing one command buffer and one response buffer at a
@@ -222,4 +232,44 @@ enum Error {
     ResponseTooLong { size: usize },
     #[error("vtpm failed to write to guest memory: {0}")]
     Write(io::Error),
+}
+
+/// Module for creating a Virtio TPM device.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct VirtioTpmModule;
+
+impl VirtioTpmModule {
+    /// Create a new VirtioTpmModule.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl VirtioDeviceModule for VirtioTpmModule {
+    fn sort_name(&self) -> &'static str {
+        "vtpm"
+    }
+
+    fn create(&self, args: &mut VirtioDeviceArgs<'_>) -> anyhow::Result<Box<dyn VirtioDevice>> {
+        let backend = VtpmProxy::new();
+        let dev = Tpm::new(
+            Box::new(backend),
+            virtio::base_features(args.protection_type),
+        );
+        Ok(Box::new(dev))
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn create_jail(&self, jail_config: &JailConfig) -> anyhow::Result<Option<Minijail>> {
+        let mut config = jail::SandboxConfig::new(jail_config, "vtpm_proxy_device");
+        config.bind_mounts = true;
+        let mut jail = jail::create_sandbox_minijail(
+            &jail_config.pivot_root,
+            jail::MAX_OPEN_FILES_DEFAULT,
+            &config,
+        )?;
+        let system_bus_socket_path = std::path::Path::new("/run/dbus/system_bus_socket");
+        jail.mount_bind(system_bus_socket_path, system_bus_socket_path, true)?;
+        Ok(Some(jail))
+    }
 }
