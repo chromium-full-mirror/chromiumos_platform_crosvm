@@ -263,6 +263,7 @@ fn create_vhost_user_block_device(
         vm_evt_wrtube,
         None,
         None,
+        /* is_remote_backend= */ true,
     )
     .exit_context(
         Exit::VhostUserBlockDeviceNew,
@@ -298,6 +299,7 @@ fn create_vhost_user_gpu_device(
     base_features: u64,
     connection: Connection,
     vm_evt_wrtube: SendTube,
+    is_remote_backend: bool,
 ) -> DeviceResult {
     let dev = virtio::VhostUserFrontend::new(
         virtio::DeviceType::Gpu,
@@ -306,6 +308,7 @@ fn create_vhost_user_gpu_device(
         vm_evt_wrtube,
         None,
         None,
+        is_remote_backend,
     )
     .exit_context(
         Exit::VhostUserGpuDeviceNew,
@@ -323,6 +326,7 @@ fn create_vhost_user_snd_device(
     base_features: u64,
     connection: Connection,
     vm_evt_wrtube: SendTube,
+    is_remote_backend: bool,
 ) -> DeviceResult {
     let dev = virtio::VhostUserFrontend::new(
         virtio::DeviceType::Sound,
@@ -331,6 +335,7 @@ fn create_vhost_user_snd_device(
         vm_evt_wrtube,
         None,
         None,
+        is_remote_backend,
     )
     .exit_context(
         Exit::VhostUserSndDeviceNew,
@@ -391,6 +396,7 @@ fn create_vhost_user_net_device(
         vm_evt_wrtube,
         None,
         None,
+        /* is_remote_backend= */ true,
     )
     .exit_context(
         Exit::VhostUserNetDeviceNew,
@@ -561,6 +567,7 @@ fn create_virtio_devices(
         add_control_tube(AnyControlTube::VmMemoryTube {
             tube: dynamic_mapping_host_tube,
             expose_with_viommu: false,
+            remote_peer: false,
         });
 
         devs.push((
@@ -761,6 +768,8 @@ fn create_virtio_gpu_device(
 ) -> DeviceResult<VirtioDeviceStub> {
     product::push_gpu_control_tubes(add_control_tube, &mut gpu_vmm_config);
 
+    let is_remote_backend = cfg.gpu_backend_config.is_none();
+
     // If the GPU backend is passed, start up the vhost-user worker in the main process.
     if let Some(backend_config) = cfg.gpu_backend_config.take() {
         let event_devices = event_devices.ok_or_else(|| {
@@ -786,6 +795,7 @@ fn create_virtio_gpu_device(
         virtio::base_features(cfg.protection_type),
         connection,
         vm_evt_wrtube,
+        is_remote_backend,
     )
     .context("create vhost-user GPU device")
 }
@@ -803,6 +813,8 @@ fn create_virtio_snd_device(
         .expect("snd_vmm_config must exist");
     product::push_snd_control_tubes(add_control_tube, snd_vmm_config);
 
+    let is_remote_backend = snd_split_config.backend_config.is_none();
+
     // If the SND backend is passed, start up the vhost-user worker in the main process.
     if let Some(backend_config) = snd_split_config.backend_config.take() {
         std::thread::spawn(move || run_snd_device_worker(backend_config));
@@ -819,6 +831,7 @@ fn create_virtio_snd_device(
         virtio::base_features(cfg.protection_type),
         connection,
         vm_evt_wrtube,
+        is_remote_backend,
     )
     .context("create vhost-user SND device")
 }
@@ -859,6 +872,7 @@ fn create_devices(
             add_control_tube(AnyControlTube::VmMemoryTube {
                 tube: host_tube,
                 expose_with_viommu: false,
+                remote_peer: stub.jail.is_some(),
             });
             Some(device_tube)
         } else {
@@ -870,6 +884,7 @@ fn create_devices(
         add_control_tube(AnyControlTube::VmMemoryTube {
             tube: ioevent_host_tube,
             expose_with_viommu: false,
+            remote_peer: stub.jail.is_some(),
         });
 
         let (vm_control_host_tube, vm_control_device_tube) =
@@ -1167,6 +1182,36 @@ fn handle_run_mode_change_for_vm_request(run_mode_opt: &Option<VmRunMode>) -> Op
     None
 }
 
+pub struct VmMemoryTube {
+    pub tube: Tube,
+    /// Whether the other end of the tube is in another process.
+    pub remote_peer: bool,
+}
+
+impl AsRef<Tube> for VmMemoryTube {
+    fn as_ref(&self) -> &Tube {
+        &self.tube
+    }
+}
+
+impl AsRawDescriptor for VmMemoryTube {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.as_ref().as_raw_descriptor()
+    }
+}
+
+impl ReadNotifier for VmMemoryTube {
+    fn get_read_notifier(&self) -> &dyn AsRawDescriptor {
+        self.as_ref().get_read_notifier()
+    }
+}
+
+impl CloseNotifier for VmMemoryTube {
+    fn get_close_notifier(&self) -> &dyn AsRawDescriptor {
+        self.as_ref().get_close_notifier()
+    }
+}
+
 /// Commands to control the VM Memory handler thread.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum VmMemoryHandlerRequest {
@@ -1175,7 +1220,7 @@ pub enum VmMemoryHandlerRequest {
 }
 
 fn vm_memory_handler_thread(
-    control_tubes: Vec<Tube>,
+    control_tubes: Vec<VmMemoryTube>,
     vm: Arc<dyn Vm>,
     sys_allocator_mutex: Arc<Mutex<SystemAllocator>>,
     #[cfg(feature = "gpu")] mut gralloc: RutabagaGralloc,
@@ -1227,7 +1272,7 @@ fn vm_memory_handler_thread(
                 },
 
                 Token::VmControl { id } => {
-                    if let Some(tube) = control_tubes.get(&id) {
+                    if let Some(VmMemoryTube { tube, remote_peer }) = control_tubes.get(&id) {
                         match tube.recv::<VmMemoryRequest>() {
                             Ok(request) => {
                                 let response = request.execute(
@@ -1237,6 +1282,7 @@ fn vm_memory_handler_thread(
                                     &mut gralloc,
                                     None,
                                     &mut region_state,
+                                    *remote_peer,
                                 );
                                 if let Err(e) = tube.send(&response) {
                                     error!("failed to send VmMemoryControlResponse: {}", e);
@@ -1362,9 +1408,10 @@ fn run_control(
             AnyControlTube::VmMemoryTube {
                 tube,
                 expose_with_viommu,
+                remote_peer,
             } => {
                 assert!(!expose_with_viommu);
-                vm_memory_control_tubes.push(tube);
+                vm_memory_control_tubes.push(VmMemoryTube { tube, remote_peer });
             }
             AnyControlTube::VmMsync(_) => {
                 unimplemented!("VmMsync control tube not supported on Windows");
