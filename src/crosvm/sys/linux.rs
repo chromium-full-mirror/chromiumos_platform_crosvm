@@ -964,6 +964,7 @@ fn create_virtio_devices(
         "wayland",
         "multi_touch",
         "window_keyboard",
+        "gpu",
         "console",
         "disk",
         "scsi",
@@ -4077,6 +4078,8 @@ fn run_control(
             VmResponse::Ok => (),
             resp => bail!("device sleep failed: {}", resp),
         }
+        VmRunMode::Suspending
+    } else if cfg.suspended_vcpus {
         VmRunMode::Suspending
     } else {
         VmRunMode::Running
