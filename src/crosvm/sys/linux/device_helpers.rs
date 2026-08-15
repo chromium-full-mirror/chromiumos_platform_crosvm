@@ -24,7 +24,6 @@ use anyhow::Result;
 use arch::VirtioDeviceStub;
 use base::linux::MemfdSeals;
 use base::sys::SharedMemoryLinux;
-use base::ReadNotifier;
 use base::*;
 use devices::serial_device::SerialParameters;
 use devices::serial_device::SerialType;
@@ -411,19 +410,6 @@ pub fn create_vhost_user_frontend(
         dev: Box::new(dev),
         // no sandbox here because virtqueue handling is exported to a different process.
         jail: None,
-    })
-}
-
-pub fn create_virtio_rng_device(
-    protection_type: ProtectionType,
-    jail_config: Option<&JailConfig>,
-) -> DeviceResult {
-    let dev =
-        virtio::Rng::new(virtio::base_features(protection_type)).context("failed to set up rng")?;
-
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: simple_jail(jail_config, "rng_device")?,
     })
 }
 
@@ -1034,19 +1020,16 @@ pub fn create_video_device(
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 pub fn register_video_device(
     backend: VideoBackendType,
-    devs: &mut Vec<VirtioDeviceStub>,
+    devs: &mut Vec<(&'static str, VirtioDeviceStub)>,
     video_tube: Tube,
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,
     typ: VideoDeviceType,
 ) -> Result<()> {
-    devs.push(create_video_device(
-        backend,
-        protection_type,
-        jail_config,
-        typ,
-        video_tube,
-    )?);
+    devs.push((
+        "video",
+        create_video_device(backend, protection_type, jail_config, typ, video_tube)?,
+    ));
     Ok(())
 }
 

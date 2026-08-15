@@ -101,6 +101,8 @@ use devices::GvmIrqChip;
 #[cfg(target_arch = "aarch64")]
 use devices::IrqChip;
 use devices::UserspaceIrqChip;
+use devices::VirtioDeviceArgs;
+use devices::VirtioDeviceModule;
 use devices::VirtioPciDevice;
 #[cfg(feature = "whpx")]
 use devices::WhpxSplitIrqChip;
@@ -162,6 +164,7 @@ use sync::Mutex;
 use tube_transporter::TubeToken;
 use tube_transporter::TubeTransporterReader;
 use vm_control::api::VmMemoryClient;
+use vm_control::AnyControlTube;
 #[cfg(feature = "balloon")]
 use vm_control::BalloonTube;
 use vm_control::DeviceControlCommand;
@@ -400,16 +403,6 @@ fn create_vhost_user_net_device(
     })
 }
 
-fn create_virtio_rng_device(cfg: &Config) -> DeviceResult {
-    let dev = virtio::Rng::new(virtio::base_features(cfg.protection_type))
-        .exit_context(Exit::RngDeviceNew, "failed to set up rng")?;
-
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: None,
-    })
-}
-
 fn create_console_device(cfg: &Config, param: &SerialParameters) -> DeviceResult {
     let mut keep_rds = Vec::new();
     let evt = Event::new().exit_context(Exit::CreateEvent, "failed to create event")?;
@@ -476,13 +469,11 @@ fn create_vsock_device(cfg: &Config) -> DeviceResult {
 
 fn create_virtio_devices(
     cfg: &mut Config,
+    vm: &dyn VmArch,
+    resources: &mut SystemAllocator,
     vm_evt_wrtube: &SendTube,
-    #[allow(clippy::ptr_arg)] control_tubes: &mut Vec<TaggedControlTube>,
-    disk_device_tubes: &mut Vec<Tube>,
+    add_control_tube: &mut dyn FnMut(AnyControlTube),
     initial_audio_session_states: &mut Vec<InitialAudioSessionState>,
-    balloon_device_tube: Option<Tube>,
-    #[cfg(feature = "pvclock")] pvclock_device_tube: Option<Tube>,
-    dynamic_mapping_device_tube: Option<Tube>,
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
     tsc_frequency: u64,
@@ -493,19 +484,20 @@ fn create_virtio_devices(
         // Disk devices must precede virtio-console devices or the kernel does not boot.
         // TODO(b/171215421): figure out why this ordering is required and fix it.
         for disk in &cfg.disks {
-            let disk_device_tube = disk_device_tubes.remove(0);
-            devs.push(create_block_device(cfg, disk, disk_device_tube)?);
+            let (disk_host_tube, disk_device_tube) =
+                Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
+            add_control_tube(AnyControlTube::Disk(disk_host_tube));
+            devs.push(("block", create_block_device(cfg, disk, disk_device_tube)?));
         }
     } else {
         info!("Starting up vhost user block backends...");
         for _disk in &cfg.disks {
             let disk_device_tube = cfg.block_vhost_user_tube.remove(0);
             let connection = Connection::from(disk_device_tube);
-            devs.push(create_vhost_user_block_device(
-                cfg,
-                connection,
-                vm_evt_wrtube.try_clone()?,
-            )?);
+            devs.push((
+                "block",
+                create_vhost_user_block_device(cfg, connection, vm_evt_wrtube.try_clone()?)?,
+            ));
         }
     }
 
@@ -515,19 +507,22 @@ fn create_virtio_devices(
         .filter(|(_k, v)| v.hardware == SerialHardware::VirtioConsole)
     {
         let dev = create_console_device(cfg, param)?;
-        devs.push(dev);
+        devs.push(("console", dev));
     }
 
     #[cfg(feature = "audio")]
     {
         let snd_split_configs = std::mem::take(&mut cfg.snd_split_configs);
         for mut snd_split_cfg in snd_split_configs.into_iter() {
-            devs.push(create_virtio_snd_device(
-                cfg,
-                &mut snd_split_cfg,
-                control_tubes,
-                vm_evt_wrtube.try_clone()?,
-            )?);
+            devs.push((
+                "snd",
+                create_virtio_snd_device(
+                    cfg,
+                    &mut snd_split_cfg,
+                    add_control_tube,
+                    vm_evt_wrtube.try_clone()?,
+                )?,
+            ));
             if let Some(vmm_config) = snd_split_cfg.vmm_config {
                 let initial_audio_session_state = InitialAudioSessionState {
                     audio_client_guid: vmm_config.audio_client_guid,
@@ -539,36 +534,48 @@ fn create_virtio_devices(
     }
 
     #[cfg(feature = "pvclock")]
-    if let Some(tube) = pvclock_device_tube {
-        product::push_pvclock_device(cfg, &mut devs, tsc_frequency, tube);
+    if cfg.pvclock {
+        let (host, device) =
+            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
+        add_control_tube(AnyControlTube::PvClock(host));
+        product::push_pvclock_device(cfg, &mut devs, tsc_frequency, device);
     }
-
-    devs.push(create_virtio_rng_device(cfg)?);
 
     #[cfg(feature = "slirp")]
     if let Some(net_vhost_user_tube) = cfg.net_vhost_user_tube.take() {
         let connection = Connection::from(net_vhost_user_tube);
-        devs.push(create_vhost_user_net_device(
-            cfg,
-            connection,
-            vm_evt_wrtube.try_clone()?,
-        )?);
+        devs.push((
+            "net",
+            create_vhost_user_net_device(cfg, connection, vm_evt_wrtube.try_clone()?)?,
+        ));
     }
 
     #[cfg(feature = "balloon")]
-    if let (Some(balloon_device_tube), Some(dynamic_mapping_device_tube)) =
-        (balloon_device_tube, dynamic_mapping_device_tube)
-    {
-        devs.push(create_balloon_device(
-            cfg,
-            balloon_device_tube,
-            dynamic_mapping_device_tube,
-            inflate_tube,
-            init_balloon_size,
-        )?);
+    if cfg.balloon {
+        let (balloon_host_tube, balloon_device_tube) =
+            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
+        add_control_tube(AnyControlTube::Balloon(balloon_host_tube));
+
+        let (dynamic_mapping_host_tube, dynamic_mapping_device_tube) =
+            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
+        add_control_tube(AnyControlTube::VmMemoryTube {
+            tube: dynamic_mapping_host_tube,
+            expose_with_viommu: false,
+        });
+
+        devs.push((
+            "balloon",
+            create_balloon_device(
+                cfg,
+                balloon_device_tube,
+                dynamic_mapping_device_tube,
+                inflate_tube,
+                init_balloon_size,
+            )?,
+        ));
     }
 
-    devs.push(create_vsock_device(cfg)?);
+    devs.push(("vsock", create_vsock_device(cfg)?));
 
     #[cfg(feature = "gpu")]
     let event_devices = if let Some(InputEventSplitConfig {
@@ -592,7 +599,7 @@ fn create_virtio_devices(
         .map(|split_cfg| &mut split_cfg.vmm_config)
     {
         product::push_window_procedure_thread_control_tubes(
-            control_tubes,
+            add_control_tube,
             wndproc_thread_vmm_config,
         );
     }
@@ -608,24 +615,65 @@ fn create_virtio_devices(
 
     #[cfg(feature = "gpu")]
     if let Some(gpu_vmm_config) = cfg.gpu_vmm_config.take() {
-        devs.push(create_virtio_gpu_device(
-            cfg,
-            gpu_vmm_config,
-            event_devices,
-            &mut wndproc_thread,
-            control_tubes,
-            vm_evt_wrtube.try_clone()?,
-        )?);
+        devs.push((
+            "gpu",
+            create_virtio_gpu_device(
+                cfg,
+                gpu_vmm_config,
+                event_devices,
+                &mut wndproc_thread,
+                add_control_tube,
+                vm_evt_wrtube.try_clone()?,
+            )?,
+        ));
     }
 
-    Ok(devs)
+    for virtio_device_module in &cfg.virtio_device_modules {
+        let mut args = VirtioDeviceArgs {
+            vm: vm as &dyn Vm,
+            resources,
+            add_control_tube,
+            protection_type: cfg.protection_type,
+        };
+        let dev = virtio_device_module
+            .create(&mut args)
+            .context("failed to create virtio device")?;
+        devs.push((
+            virtio_device_module.sort_name(),
+            VirtioDeviceStub { dev, jail: None },
+        ));
+    }
+
+    // Sort the devices to match a legacy ordering (the order affects PCI addresses etc). This
+    // allows us to move devices to the VirtioDeviceModule style without side effects.
+    //
+    // Doesn't provide a complete ordering, for example, all the input devices are aliased together
+    // and so the order between them will be determined by the cmdline processing code, which
+    // matches legacy behavior.
+    let device_order = [
+        "block",
+        "console",
+        "snd",
+        "pvclock",
+        "rng",
+        "net",
+        "balloon",
+        "vsock",
+        "multi_touch",
+        "mouse",
+        "window_keyboard",
+        "gpu",
+    ];
+    devs.sort_by_key(|(name, _)| device_order.iter().position(|s| s == name).unwrap_or(9999));
+
+    Ok(devs.into_iter().map(|(_, dev)| dev).collect())
 }
 
 #[cfg(feature = "gpu")]
 fn create_virtio_input_event_devices(
     cfg: &Config,
     mut input_event_vmm_config: InputEventVmmConfig,
-) -> DeviceResult<Vec<VirtioDeviceStub>> {
+) -> DeviceResult<Vec<(&'static str, VirtioDeviceStub)>> {
     let mut devs = Vec::new();
 
     // Iterate event devices, create the VMM end.
@@ -657,14 +705,17 @@ fn create_virtio_input_event_devices(
                         height = cfg.display_input_height;
                     }
                 }
-                devs.push(create_multi_touch_device(
-                    cfg,
-                    pipe,
-                    width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
-                    height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
-                    name.as_deref(),
-                    idx as u32,
-                )?);
+                devs.push((
+                    "multi_touch",
+                    create_multi_touch_device(
+                        cfg,
+                        pipe,
+                        width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
+                        height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
+                        name.as_deref(),
+                        idx as u32,
+                    )?,
+                ));
             }
             _ => {}
         }
@@ -674,7 +725,7 @@ fn create_virtio_input_event_devices(
     product::push_mouse_device(cfg, &mut input_event_vmm_config, &mut devs)?;
 
     for (idx, pipe) in input_event_vmm_config.mouse_pipes.drain(..).enumerate() {
-        devs.push(create_mouse_device(cfg, pipe, idx as u32)?);
+        devs.push(("mouse", create_mouse_device(cfg, pipe, idx as u32)?));
     }
 
     let keyboard_pipe = input_event_vmm_config
@@ -688,10 +739,13 @@ fn create_virtio_input_event_devices(
     )
     .exit_context(Exit::InputDeviceNew, "failed to set up input device")?;
 
-    devs.push(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: None,
-    });
+    devs.push((
+        "window_keyboard",
+        VirtioDeviceStub {
+            dev: Box::new(dev),
+            jail: None,
+        },
+    ));
 
     Ok(devs)
 }
@@ -702,10 +756,10 @@ fn create_virtio_gpu_device(
     mut gpu_vmm_config: GpuVmmConfig,
     event_devices: Option<Vec<EventDevice>>,
     wndproc_thread: &mut Option<WindowProcedureThread>,
-    #[allow(clippy::ptr_arg)] control_tubes: &mut Vec<TaggedControlTube>,
+    add_control_tube: &mut dyn FnMut(AnyControlTube),
     vm_evt_wrtube: SendTube,
 ) -> DeviceResult<VirtioDeviceStub> {
-    product::push_gpu_control_tubes(control_tubes, &mut gpu_vmm_config);
+    product::push_gpu_control_tubes(add_control_tube, &mut gpu_vmm_config);
 
     // If the GPU backend is passed, start up the vhost-user worker in the main process.
     if let Some(backend_config) = cfg.gpu_backend_config.take() {
@@ -740,14 +794,14 @@ fn create_virtio_gpu_device(
 fn create_virtio_snd_device(
     cfg: &mut Config,
     snd_split_config: &mut SndSplitConfig,
-    #[allow(clippy::ptr_arg)] control_tubes: &mut Vec<TaggedControlTube>,
+    add_control_tube: &mut dyn FnMut(AnyControlTube),
     vm_evt_wrtube: SendTube,
 ) -> DeviceResult<VirtioDeviceStub> {
     let snd_vmm_config = snd_split_config
         .vmm_config
         .as_mut()
         .expect("snd_vmm_config must exist");
-    product::push_snd_control_tubes(control_tubes, snd_vmm_config);
+    product::push_snd_control_tubes(add_control_tube, snd_vmm_config);
 
     // If the SND backend is passed, start up the vhost-user worker in the main process.
     if let Some(backend_config) = snd_split_config.backend_config.take() {
@@ -771,30 +825,22 @@ fn create_virtio_snd_device(
 
 fn create_devices(
     cfg: &mut Config,
-    mem: &GuestMemory,
+    vm: &dyn VmArch,
+    resources: &mut SystemAllocator,
     exit_evt_wrtube: &SendTube,
-    irq_control_tubes: &mut Vec<Tube>,
-    vm_memory_control_tubes: &mut Vec<Tube>,
-    control_tubes: &mut Vec<TaggedControlTube>,
-    disk_device_tubes: &mut Vec<Tube>,
+    add_control_tube: &mut dyn FnMut(AnyControlTube),
     initial_audio_session_states: &mut Vec<InitialAudioSessionState>,
-    balloon_device_tube: Option<Tube>,
-    #[cfg(feature = "pvclock")] pvclock_device_tube: Option<Tube>,
-    dynamic_mapping_device_tube: Option<Tube>,
     inflate_tube: Option<Tube>,
     init_balloon_size: u64,
     tsc_frequency: u64,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let stubs = create_virtio_devices(
         cfg,
+        vm,
+        resources,
         exit_evt_wrtube,
-        control_tubes,
-        disk_device_tubes,
+        add_control_tube,
         initial_audio_session_states,
-        balloon_device_tube,
-        #[cfg(feature = "pvclock")]
-        pvclock_device_tube,
-        dynamic_mapping_device_tube,
         inflate_tube,
         init_balloon_size,
         tsc_frequency,
@@ -805,12 +851,15 @@ fn create_devices(
     for stub in stubs {
         let (msi_host_tube, msi_device_tube) =
             Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-        irq_control_tubes.push(msi_host_tube);
+        add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
 
         let shared_memory_tube = if stub.dev.get_shared_memory_region().is_some() {
             let (host_tube, device_tube) =
                 Tube::pair().context("failed to create VVU proxy tube")?;
-            vm_memory_control_tubes.push(host_tube);
+            add_control_tube(AnyControlTube::VmMemoryTube {
+                tube: host_tube,
+                expose_with_viommu: false,
+            });
             Some(device_tube)
         } else {
             None
@@ -818,17 +867,18 @@ fn create_devices(
 
         let (ioevent_host_tube, ioevent_device_tube) =
             Tube::pair().context("failed to create ioevent tube")?;
-        vm_memory_control_tubes.push(ioevent_host_tube);
+        add_control_tube(AnyControlTube::VmMemoryTube {
+            tube: ioevent_host_tube,
+            expose_with_viommu: false,
+        });
 
         let (vm_control_host_tube, vm_control_device_tube) =
             Tube::pair().context("failed to create vm_control tube")?;
-        control_tubes.push(TaggedControlTube::Vm(FlushOnDropTube::from(
-            vm_control_host_tube,
-        )));
+        add_control_tube(AnyControlTube::Vm(vm_control_host_tube));
 
         let dev = Box::new(
             VirtioPciDevice::new(
-                mem.clone(),
+                vm.get_memory().clone(),
                 stub.dev,
                 msi_device_tube,
                 cfg.disable_virtio_intx,
@@ -1245,16 +1295,10 @@ fn create_control_server(
 fn run_control(
     mut guest_os: RunnableLinuxVm,
     sys_allocator: SystemAllocator,
-    control_tubes: Vec<TaggedControlTube>,
-    irq_control_tubes: Vec<Tube>,
-    vm_memory_control_tubes: Vec<Tube>,
+    all_control_tubes: Vec<AnyControlTube>,
     vm_evt_rdtube: RecvTube,
     vm_evt_wrtube: SendTube,
-    #[cfg(feature = "gpu")] gpu_control_tube: Option<Tube>,
     broker_shutdown_evt: Option<Event>,
-    balloon_host_tube: Option<Tube>,
-    #[cfg(feature = "pvclock")] pvclock_host_tube: Option<Tube>,
-    disk_host_tubes: Vec<Tube>,
     initial_audio_session_states: Vec<InitialAudioSessionState>,
     gralloc: RutabagaGralloc,
     #[cfg(feature = "stats")] stats: Option<Arc<Mutex<StatisticsCollector>>>,
@@ -1270,6 +1314,64 @@ fn run_control(
     force_s2idle: bool,
     suspended: bool,
 ) -> Result<ExitState> {
+    #[cfg(feature = "balloon")]
+    let mut balloon_host_tube = None;
+    let mut disk_host_tubes = Vec::new();
+    #[cfg(feature = "gpu")]
+    let mut gpu_control_tube = None;
+    #[cfg(feature = "pvclock")]
+    let mut pvclock_host_tube = None;
+    let mut irq_control_tubes = Vec::new();
+    let mut vm_memory_control_tubes = Vec::new();
+    let mut control_tubes = Vec::new();
+
+    for t in all_control_tubes {
+        match t {
+            #[cfg(feature = "balloon")]
+            AnyControlTube::Balloon(t) => {
+                assert!(balloon_host_tube.is_none());
+                balloon_host_tube = Some(t);
+            }
+            #[cfg(not(feature = "balloon"))]
+            AnyControlTube::Balloon(_) => unreachable!(),
+            AnyControlTube::Disk(t) => disk_host_tubes.push(t),
+            AnyControlTube::Fs(_) => {
+                unimplemented!("fs control tube not supported on Windows");
+            }
+            #[cfg(feature = "gpu")]
+            AnyControlTube::Gpu(t) => {
+                assert!(gpu_control_tube.is_none());
+                gpu_control_tube = Some(t);
+            }
+            #[cfg(not(feature = "gpu"))]
+            AnyControlTube::Gpu(_) => unreachable!(),
+            AnyControlTube::IrqTube(t) => irq_control_tubes.push(t),
+            #[cfg(feature = "pvclock")]
+            AnyControlTube::PvClock(t) => {
+                assert!(pvclock_host_tube.is_none());
+                pvclock_host_tube = Some(t);
+            }
+            #[cfg(not(feature = "pvclock"))]
+            AnyControlTube::PvClock(_) => unreachable!(),
+            AnyControlTube::Snd(_) => {
+                unimplemented!("snd control tube not supported on Windows");
+            }
+            AnyControlTube::Vm(t) => {
+                control_tubes.push(TaggedControlTube::Vm(FlushOnDropTube::from(t)));
+            }
+            AnyControlTube::VmMemoryTube {
+                tube,
+                expose_with_viommu,
+            } => {
+                assert!(!expose_with_viommu);
+                vm_memory_control_tubes.push(tube);
+            }
+            AnyControlTube::VmMsync(_) => {
+                unimplemented!("VmMsync control tube not supported on Windows");
+            }
+        }
+    }
+
     let (ipc_main_loop_tube, proto_main_loop_tube, _service_ipc) =
         start_service_ipc_listener(service_pipe_name)?;
 
@@ -2422,52 +2524,12 @@ fn run_vm(
     vm_evt_rdtube: RecvTube,
 ) -> Result<ExitState> {
     let vm_memory_size_mb = components.memory_size / (1024 * 1024);
-    let mut control_tubes = Vec::new();
-    let mut irq_control_tubes = Vec::new();
-    let mut vm_memory_control_tubes = Vec::new();
-    // Create one control tube per disk.
-    let mut disk_device_tubes = Vec::new();
-    let mut disk_host_tubes = Vec::new();
-    let disk_count = cfg.disks.len();
-    for _ in 0..disk_count {
-        let (disk_host_tube, disk_device_tube) =
-            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-        disk_host_tubes.push(disk_host_tube);
-        disk_device_tubes.push(disk_device_tube);
-    }
+    let mut all_control_tubes = Vec::new();
+    let mut add_control_tube = |t: AnyControlTube| all_control_tubes.push(t);
 
     if let Some(ioapic_host_tube) = ioapic_host_tube {
-        irq_control_tubes.push(ioapic_host_tube);
+        add_control_tube(AnyControlTube::IrqTube(ioapic_host_tube));
     }
-
-    // Balloon gets a special socket so balloon requests can be forwarded from the main process.
-    let (balloon_host_tube, balloon_device_tube) = if cfg.balloon {
-        let (balloon_host_tube, balloon_device_tube) =
-            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-        (Some(balloon_host_tube), Some(balloon_device_tube))
-    } else {
-        (None, None)
-    };
-    // The balloon device also needs a tube to communicate back to the main process to
-    // handle remapping memory dynamically.
-    let dynamic_mapping_device_tube = if cfg.balloon {
-        let (dynamic_mapping_host_tube, dynamic_mapping_device_tube) =
-            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-        vm_memory_control_tubes.push(dynamic_mapping_host_tube);
-        Some(dynamic_mapping_device_tube)
-    } else {
-        None
-    };
-
-    // PvClock gets a tube for handling suspend/resume requests from the main thread.
-    #[cfg(feature = "pvclock")]
-    let (pvclock_host_tube, pvclock_device_tube) = if cfg.pvclock {
-        let (host, device) =
-            Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-        (Some(host), Some(device))
-    } else {
-        (None, None)
-    };
 
     let gralloc = RutabagaGralloc::new(RutabagaGrallocBackendFlags::new())
         .exit_context(Exit::CreateGralloc, "failed to create gralloc")?;
@@ -2521,10 +2583,13 @@ fn run_vm(
     }
 
     #[cfg(feature = "gpu")]
-    let gpu_control_tube = cfg
+    if let Some(gpu_control_tube) = cfg
         .gpu_vmm_config
         .as_mut()
-        .and_then(|config| config.gpu_control_host_tube.take());
+        .and_then(|config| config.gpu_control_host_tube.take())
+    {
+        add_control_tube(AnyControlTube::Gpu(gpu_control_tube));
+    }
     let product_args = product::get_run_control_args(&mut cfg);
 
     // We open these files before lowering the token, as in the future a stricter policy may
@@ -2579,17 +2644,11 @@ fn run_vm(
 
     let pci_devices = create_devices(
         &mut cfg,
-        vm.get_memory(),
+        &*vm,
+        &mut sys_allocator,
         &vm_evt_wrtube,
-        &mut irq_control_tubes,
-        &mut vm_memory_control_tubes,
-        &mut control_tubes,
-        &mut disk_device_tubes,
+        &mut add_control_tube,
         &mut initial_audio_session_states,
-        balloon_device_tube,
-        #[cfg(feature = "pvclock")]
-        pvclock_device_tube,
-        dynamic_mapping_device_tube,
         /* inflate_tube= */ None,
         init_balloon_size,
         tsc_state.frequency,
@@ -2631,18 +2690,10 @@ fn run_vm(
     run_control(
         windows,
         sys_allocator,
-        control_tubes,
-        irq_control_tubes,
-        vm_memory_control_tubes,
+        all_control_tubes,
         vm_evt_rdtube,
         vm_evt_wrtube,
-        #[cfg(feature = "gpu")]
-        gpu_control_tube,
         cfg.broker_shutdown_event.take(),
-        balloon_host_tube,
-        #[cfg(feature = "pvclock")]
-        pvclock_host_tube,
-        disk_host_tubes,
         initial_audio_session_states,
         gralloc,
         #[cfg(feature = "stats")]

@@ -73,6 +73,7 @@ use x86_64::check_host_hybrid_support;
 #[cfg(target_arch = "x86_64")]
 use x86_64::CpuIdCall;
 
+use super::any_device_module::AnyVirtioDeviceModule;
 pub(crate) use super::sys::HypervisorKind;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use crate::crosvm::sys::config::SharedDir;
@@ -742,7 +743,6 @@ pub struct Config {
     /// Must be `Some` iff `protection_type == ProtectionType::UnprotectedWithFirmware`.
     pub pvm_fw: Option<PathBuf>,
     pub restore_path: Option<PathBuf>,
-    pub rng: bool,
     pub rt_cpus: CpuSet,
     pub scsis: Vec<ScsiOption>,
     #[serde(with = "serde_serial_params")]
@@ -807,6 +807,8 @@ pub struct Config {
     ))]
     pub virt_cpufreq: bool,
     pub virt_cpufreq_v2: bool,
+    #[serde(default)]
+    pub virtio_device_modules: Vec<AnyVirtioDeviceModule>,
     pub virtio_input: Vec<InputDeviceOption>,
     #[cfg(feature = "audio")]
     #[serde(skip)]
@@ -981,7 +983,6 @@ impl Default for Config {
             pvclock: false,
             pvm_fw: None,
             restore_path: None,
-            rng: true,
             rt_cpus: Default::default(),
             serial_parameters: BTreeMap::new(),
             scsis: Vec::new(),
@@ -1042,6 +1043,7 @@ impl Default for Config {
             ))]
             virt_cpufreq: false,
             virt_cpufreq_v2: false,
+            virtio_device_modules: Vec::new(),
             virtio_input: Vec::new(),
             #[cfg(feature = "audio")]
             virtio_snds: Vec::new(),

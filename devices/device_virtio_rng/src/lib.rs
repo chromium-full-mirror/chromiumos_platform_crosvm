@@ -14,13 +14,19 @@ use base::EventToken;
 use base::RawDescriptor;
 use base::WaitContext;
 use base::WorkerThread;
+use devices::virtio;
+use devices::virtio::DeviceType;
+use devices::virtio::Interrupt;
+use devices::virtio::Queue;
+use devices::virtio::VirtioDevice;
+use devices::VirtioDeviceArgs;
+use devices::VirtioDeviceModule;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use jail::JailConfig;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use minijail::Minijail;
 use snapshot::AnySnapshot;
 use vm_memory::GuestMemory;
-
-use super::DeviceType;
-use super::Interrupt;
-use super::Queue;
-use super::VirtioDevice;
 
 const QUEUE_SIZE: u16 = 256;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
@@ -92,19 +98,9 @@ impl Worker {
 }
 
 /// Virtio device for exposing entropy to the guest OS through virtio.
-pub struct Rng {
+struct Rng {
     worker_thread: Option<WorkerThread<Worker>>,
     virtio_features: u64,
-}
-
-impl Rng {
-    /// Create a new virtio rng device that gets random data from /dev/urandom.
-    pub fn new(virtio_features: u64) -> anyhow::Result<Rng> {
-        Ok(Rng {
-            worker_thread: None,
-            virtio_features,
-        })
-    }
 }
 
 impl VirtioDevice for Rng {
@@ -181,5 +177,27 @@ impl VirtioDevice for Rng {
     fn virtio_restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
         let () = AnySnapshot::from_any(data)?;
         Ok(())
+    }
+}
+
+/// Virtio rng device that gets random data from /dev/urandom.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct VirtioRngModule;
+
+impl VirtioDeviceModule for VirtioRngModule {
+    fn sort_name(&self) -> &'static str {
+        "rng"
+    }
+
+    fn create(&self, args: &mut VirtioDeviceArgs<'_>) -> anyhow::Result<Box<dyn VirtioDevice>> {
+        Ok(Box::new(Rng {
+            worker_thread: None,
+            virtio_features: virtio::base_features(args.protection_type),
+        }))
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn create_jail(&self, jail_config: &JailConfig) -> anyhow::Result<Option<Minijail>> {
+        jail::simple_jail(Some(jail_config), "rng_device")
     }
 }
