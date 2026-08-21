@@ -288,6 +288,9 @@ tokio = ["cros_async/tokio"]
 ## USB is supported only on unix/linux. The feature is a no-op on windows.
 usb = ["devices/usb"]
 
+## Enables the virtio-wl device.
+virtio_wl = ["devices/virtio_wl"]
+
 ## Enables the non-upstream virtio wayland protocol. This can be used in conjuction with the gpu
 ## feature to enable a zero-copy display pipeline.
 wl-dmabuf = ["devices/gbm"]
