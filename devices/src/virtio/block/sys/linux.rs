@@ -4,9 +4,14 @@
 
 use std::cmp::max;
 use std::cmp::min;
+use std::os::fd::BorrowedFd;
 
 use anyhow::Context;
+use base::linux::preadv2;
+use base::linux::pwritev2;
 use base::unix::iov_max;
+use base::IoBufMut;
+use base::RawDescriptor;
 use cros_async::Executor;
 use disk::DiskFile;
 
@@ -20,6 +25,35 @@ pub fn get_seg_max(queue_size: u16) -> u32 {
     // number of segments must be smaller than the queue size.
     // In addition, the request header and status each consume a descriptor.
     min(seg_max, u32::from(queue_size) - 2)
+}
+
+pub fn check_dontcache_support(fd: RawDescriptor, write: bool) -> bool {
+    let mut buf = [0u8; 1];
+    let mut iovs = [IoBufMut::new(&mut buf)];
+    // SAFETY: fd is an open file descriptor.
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let res = if write {
+        pwritev2(
+            borrowed_fd,
+            IoBufMut::as_iobufs(&iovs),
+            0,
+            libc::RWF_DONTCACHE,
+        )
+    } else {
+        preadv2(borrowed_fd, &mut iovs, 0, libc::RWF_DONTCACHE)
+    };
+    if res < 0 {
+        let err = base::Error::last();
+        match err.errno() {
+            libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS => false,
+            _ => {
+                base::warn!("Unexpected error checking for DONTCACHE support: {err}");
+                false
+            }
+        }
+    } else {
+        true
+    }
 }
 
 impl DiskOption {
