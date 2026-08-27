@@ -13,8 +13,6 @@ pub mod device_constants;
 pub mod input;
 mod interrupt;
 mod iommu;
-#[cfg(feature = "net")]
-pub mod net;
 #[cfg(feature = "pvclock")]
 pub mod pvclock;
 mod queue;
@@ -75,21 +73,13 @@ pub use self::iommu::ipc_memory_mapper;
 pub use self::iommu::memory_mapper;
 pub use self::iommu::Iommu;
 pub use self::iommu::IommuError;
-#[cfg(feature = "net")]
-pub use self::net::Net;
-#[cfg(feature = "net")]
-pub use self::net::NetError;
-#[cfg(feature = "net")]
-pub use self::net::NetParameters;
-#[cfg(feature = "net")]
-pub use self::net::NetParametersMode;
 pub use self::queue::split_descriptor_chain::Desc;
 pub use self::queue::split_descriptor_chain::SplitDescriptorChain;
 pub use self::queue::PeekedDescriptorChain;
 pub use self::queue::Queue;
 pub use self::queue::QueueConfig;
-pub use self::scsi::Controller as ScsiController;
 pub use self::scsi::DiskConfig as ScsiDiskConfig;
+pub use self::scsi::VirtioScsiModule;
 pub use self::vhost_user_frontend::VhostUserFrontend;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 pub use self::video::VideoDevice;
@@ -114,10 +104,6 @@ cfg_if::cfg_if! {
         pub mod fs;
 
         pub use self::iommu::sys::linux::vfio_wrapper;
-        #[cfg(feature = "net")]
-        pub use self::net::VhostNetParameters;
-        #[cfg(feature = "net")]
-        pub use self::net::VHOST_NET_DEFAULT_PATH;
         pub use self::p9::P9;
         pub use self::pmem::Pmem;
         pub use self::pmem::PmemConfig;

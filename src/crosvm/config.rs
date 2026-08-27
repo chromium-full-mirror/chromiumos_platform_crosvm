@@ -36,7 +36,6 @@ use devices::virtio::block::DiskOption;
 use devices::virtio::device_constants::video::VideoDeviceConfig;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::GpuParameters;
-use devices::virtio::scsi::ScsiOption;
 #[cfg(feature = "audio")]
 use devices::virtio::snd::parameters::Parameters as SndParameters;
 #[cfg(all(windows, feature = "gpu"))]
@@ -50,8 +49,6 @@ use devices::virtio::vhost_user_backend::gpu::sys::windows::WindowProcedureThrea
 #[cfg(all(windows, feature = "audio"))]
 use devices::virtio::vhost_user_backend::snd::sys::windows::SndSplitConfig;
 use devices::virtio::DeviceType;
-#[cfg(feature = "net")]
-use devices::virtio::NetParameters;
 use devices::FwCfgParameters;
 use devices::PciAddress;
 use devices::PflashParameters;
@@ -715,8 +712,6 @@ pub struct Config {
     pub name: Option<String>,
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub nested: NestedConfig,
-    #[cfg(feature = "net")]
-    pub net: Vec<NetParameters>,
     #[cfg(windows)]
     pub net_vhost_user_tube: Option<Tube>,
     pub no_i8042: bool,
@@ -750,7 +745,7 @@ pub struct Config {
     pub pvm_fw: Option<PathBuf>,
     pub restore_path: Option<PathBuf>,
     pub rt_cpus: CpuSet,
-    pub scsis: Vec<ScsiOption>,
+
     #[serde(with = "serde_serial_params")]
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     #[cfg(windows)]
@@ -958,8 +953,6 @@ impl Default for Config {
             name: None,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             nested: NestedConfig::default(),
-            #[cfg(feature = "net")]
-            net: Vec::new(),
             #[cfg(windows)]
             net_vhost_user_tube: None,
             no_i8042: false,
@@ -989,7 +982,6 @@ impl Default for Config {
             restore_path: None,
             rt_cpus: Default::default(),
             serial_parameters: BTreeMap::new(),
-            scsis: Vec::new(),
             #[cfg(windows)]
             service_pipe_name: None,
             #[cfg(any(target_os = "android", target_os = "linux"))]

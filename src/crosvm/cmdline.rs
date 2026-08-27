@@ -41,6 +41,10 @@ use arch::VcpuAffinity;
 use argh::FromArgs;
 use base::getpid;
 use cros_async::ExecutorKind;
+#[cfg(all(unix, feature = "net"))]
+use device_virtio_net::NetParameters;
+#[cfg(all(unix, feature = "net"))]
+use device_virtio_net::NetParametersMode;
 use device_virtio_vsock::VsockConfig;
 use devices::virtio::block::DiskOption;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
@@ -55,10 +59,6 @@ use devices::virtio::GpuDisplayParameters;
 use devices::virtio::GpuMouseMode;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuParameters;
-#[cfg(all(unix, feature = "net"))]
-use devices::virtio::NetParameters;
-#[cfg(all(unix, feature = "net"))]
-use devices::virtio::NetParametersMode;
 use devices::FwCfgParameters;
 use devices::PflashParameters;
 use devices::SerialHardware;
@@ -579,7 +579,7 @@ pub enum CrossPlatformDevicesCommands {
     #[cfg(feature = "gpu")]
     Gpu(vhost_user_backend::GpuOptions),
     #[cfg(feature = "net")]
-    Net(vhost_user_backend::NetOptions),
+    Net(device_virtio_net::NetOptions),
     #[cfg(feature = "audio")]
     Snd(vhost_user_backend::SndOptions),
 }
@@ -2561,8 +2561,6 @@ impl TryFrom<RunCommand> for super::config::Config {
         disks.sort_by_key(|d| d.index);
         cfg.disks = disks.into_iter().map(|d| d.disk_option).collect();
 
-        cfg.scsis = cmd.scsi_block;
-
         cfg.pmems = cmd.pmem;
 
         if !cmd.pmem_device.is_empty() || !cmd.rw_pmem_device.is_empty() {
@@ -2595,8 +2593,8 @@ impl TryFrom<RunCommand> for super::config::Config {
             .filter(|(_, d)| d.root)
             .map(|(i, d)| (format_disk_letter("/dev/vd", i), d.read_only));
 
-        let virtio_scsi_root_devs = cfg
-            .scsis
+        let virtio_scsi_root_devs = cmd
+            .scsi_block
             .iter()
             .enumerate()
             .filter(|(_, s)| s.root)
@@ -2624,6 +2622,11 @@ impl TryFrom<RunCommand> for super::config::Config {
             if root_devs.next().is_some() {
                 return Err("only one root disk can be specified".to_string());
             }
+        }
+
+        if !cmd.scsi_block.is_empty() {
+            cfg.virtio_device_modules
+                .push(devices::virtio::VirtioScsiModule::new(cmd.scsi_block).into());
         }
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -2954,10 +2957,10 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(all(unix, feature = "net"))]
         {
-            use devices::virtio::VhostNetParameters;
-            use devices::virtio::VHOST_NET_DEFAULT_PATH;
+            use device_virtio_net::VhostNetParameters;
+            use device_virtio_net::VHOST_NET_DEFAULT_PATH;
 
-            cfg.net = cmd.net;
+            let mut net_params = cmd.net;
 
             if let Some(vhost_net_device) = &cmd.vhost_net_device {
                 let vhost_net_path = vhost_net_device.to_string_lossy();
@@ -2991,7 +2994,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     "`--tap-name` is deprecated; please use \
                     `--net tap-name={tap_name}{vhost_net_msg}{vq_pairs_msg}`"
                 );
-                cfg.net.push(NetParameters {
+                net_params.push(NetParameters {
                     mode: NetParametersMode::TapName {
                         tap_name,
                         mac: None,
@@ -3009,7 +3012,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     "`--tap-fd` is deprecated; please use \
                     `--net tap-fd={tap_fd}{vhost_net_msg}{vq_pairs_msg}`"
                 );
-                cfg.net.push(NetParameters {
+                net_params.push(NetParameters {
                     mode: NetParametersMode::TapFd { tap_fd, mac: None },
                     vhost_net: vhost_net_config.clone(),
                     vq_pairs: cmd.net_vq_pairs,
@@ -3038,7 +3041,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                     `--net host-ip={host_ip},netmask={netmask},mac={mac}{vhost_net_msg}{vq_pairs_msg}`"
                 );
 
-                cfg.net.push(NetParameters {
+                net_params.push(NetParameters {
                     mode: NetParametersMode::RawConfig {
                         host_ip,
                         netmask,
@@ -3054,7 +3057,7 @@ impl TryFrom<RunCommand> for super::config::Config {
 
             // The number of vq pairs on a network device shall never exceed the number of vcpu
             // cores. Fix that up if needed.
-            for net in &mut cfg.net {
+            for net in &mut net_params {
                 if let Some(vq_pairs) = net.vq_pairs {
                     if vq_pairs as usize > cfg.vcpu_count.unwrap_or(1) {
                         log::warn!("the number of net vq pairs must not exceed the vcpu count, falling back to single queue mode");
@@ -3064,6 +3067,10 @@ impl TryFrom<RunCommand> for super::config::Config {
                 if net.mrg_rxbuf && net.packed_queue {
                     return Err("mrg_rxbuf and packed_queue together is unsupported".to_string());
                 }
+            }
+
+            for opt in net_params {
+                cfg.virtio_device_modules.push(opt.into());
             }
         }
 
