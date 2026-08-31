@@ -25,6 +25,7 @@ use arch::VirtioDeviceStub;
 use base::linux::MemfdSeals;
 use base::sys::SharedMemoryLinux;
 use base::*;
+use device_virtio_block::DiskOption;
 #[cfg(feature = "net")]
 use device_virtio_net::create_tap_for_net_device;
 #[cfg(feature = "net")]
@@ -33,10 +34,8 @@ use device_virtio_net::NetBackend;
 use device_virtio_net::NetParameters;
 use device_virtio_vsock::VsockConfig;
 use devices::serial_device::SerialParameters;
-use devices::serial_device::SerialType;
 use devices::vfio::VfioContainerManager;
 use devices::virtio;
-use devices::virtio::block::DiskOption;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoBackendType;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
@@ -47,12 +46,9 @@ use devices::virtio::memory_mapper::BasicMemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
 #[cfg(feature = "pvclock")]
 use devices::virtio::pvclock::PvClock;
-#[cfg(feature = "audio")]
-use devices::virtio::snd::parameters::Parameters as SndParameters;
 use devices::virtio::vfio_wrapper::VfioWrapper;
 use devices::virtio::vhost_user_backend::VhostUserDeviceBuilder;
 use devices::virtio::vhost_user_backend::VhostUserVsockDevice;
-use devices::virtio::Console;
 use devices::virtio::MemSlotConfig;
 use devices::virtio::PmemConfig;
 use devices::virtio::VhostUserFrontend;
@@ -175,31 +171,18 @@ impl IntoUnixStream for UnixStream {
 
 pub type DeviceResult<T = VirtioDeviceStub> = Result<T>;
 
-/// A trait for spawning virtio device instances and jails from their configuration structure.
-///
-/// Implementors become able to create virtio devices and jails following their own configuration.
-/// This trait also provides a few convenience methods for e.g. creating a virtio device and jail
-/// at once.
+/// A trait for spawning vhost-user device instances and jails from their configuration structure.
+// TODO: This isn't used for regular virtio devices anymore. Rename to VhostUserDeviceBuilder. Or,
+// dissolve it. There are too many different vhost-user builder traits.
 pub trait VirtioDeviceBuilder: Sized {
     /// Base name of the device, as it will appear in logs.
     const NAME: &'static str;
 
-    /// Create a regular virtio device from the configuration and `protection_type` setting.
-    fn create_virtio_device(
-        self,
-        protection_type: ProtectionType,
-    ) -> anyhow::Result<Box<dyn VirtioDevice>>;
-
     /// Create a device suitable for being run as a vhost-user instance.
-    ///
-    /// It is ok to leave this method unimplemented if the device is not intended to be used with
-    /// vhost-user.
     fn create_vhost_user_device(
         self,
         _keep_rds: &mut Vec<RawDescriptor>,
-    ) -> anyhow::Result<Box<dyn VhostUserDeviceBuilder>> {
-        unimplemented!()
-    }
+    ) -> anyhow::Result<Box<dyn VhostUserDeviceBuilder>>;
 
     /// Create a jail that is suitable to run a device.
     ///
@@ -214,20 +197,6 @@ pub trait VirtioDeviceBuilder: Sized {
             jail_config,
             &virtio_transport.seccomp_policy_file(Self::NAME),
         )
-    }
-
-    /// Helper method to return a `VirtioDeviceStub` filled using `create_virtio_device` and
-    /// `create_jail`.
-    ///
-    /// This helper should cover the needs of most devices when run as regular virtio devices.
-    fn create_virtio_device_and_jail(
-        self,
-        protection_type: ProtectionType,
-        jail_config: Option<&JailConfig>,
-    ) -> DeviceResult {
-        let jail = self.create_jail(jail_config, VirtioDeviceType::Regular)?;
-        let dev = self.create_virtio_device(protection_type)?;
-        Ok(VirtioDeviceStub { dev, jail })
     }
 }
 
@@ -249,29 +218,6 @@ impl<'a> DiskConfig<'a> {
 impl VirtioDeviceBuilder for DiskConfig<'_> {
     const NAME: &'static str = "block";
 
-    fn create_virtio_device(
-        self,
-        protection_type: ProtectionType,
-    ) -> anyhow::Result<Box<dyn VirtioDevice>> {
-        info!(
-            "Trying to attach block device: {}",
-            self.disk.path.display(),
-        );
-        let disk_image = self.disk.open()?;
-        let base_features = virtio::base_features(protection_type);
-        Ok(Box::new(
-            virtio::BlockAsync::new(
-                base_features,
-                disk_image,
-                self.disk,
-                self.device_tube,
-                None,
-                None,
-            )
-            .context("failed to create block device")?,
-        ))
-    }
-
     fn create_vhost_user_device(
         self,
         keep_rds: &mut Vec<RawDescriptor>,
@@ -281,7 +227,7 @@ impl VirtioDeviceBuilder for DiskConfig<'_> {
         let base_features = virtio::base_features(ProtectionType::Unprotected);
 
         let block = Box::new(
-            virtio::BlockAsync::new(
+            device_virtio_block::BlockAsync::new(
                 base_features,
                 disk_image,
                 disk,
@@ -373,60 +319,6 @@ pub fn create_vhost_user_frontend(
         dev: Box::new(dev),
         // no sandbox here because virtqueue handling is exported to a different process.
         jail: None,
-    })
-}
-
-#[cfg(feature = "audio")]
-pub fn create_virtio_snd_device(
-    protection_type: ProtectionType,
-    jail_config: Option<&JailConfig>,
-    snd_params: SndParameters,
-    snd_device_tube: Tube,
-) -> DeviceResult {
-    let backend = snd_params.backend;
-    let dev = virtio::snd::common_backend::VirtioSnd::new(
-        virtio::base_features(protection_type),
-        snd_params,
-        snd_device_tube,
-    )
-    .context("failed to create cras sound device")?;
-
-    use virtio::snd::parameters::StreamSourceBackend as Backend;
-
-    let policy = match backend {
-        Backend::NULL | Backend::FILE => "snd_null_device",
-        #[cfg(feature = "audio_aaudio")]
-        Backend::Sys(virtio::snd::sys::StreamSourceBackend::AAUDIO) => "snd_aaudio_device",
-        #[cfg(feature = "audio_cras")]
-        Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) => "snd_cras_device",
-        #[cfg(not(any(feature = "audio_cras", feature = "audio_aaudio")))]
-        _ => unreachable!(),
-    };
-
-    let jail = if let Some(jail_config) = jail_config {
-        let mut config = SandboxConfig::new(jail_config, policy);
-        #[cfg(feature = "audio_cras")]
-        if backend == Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) {
-            config.bind_mounts = true;
-        }
-        // TODO(b/267574679): running as current_user may not be required for snd device.
-        config.run_as = RunAsUser::CurrentUser;
-        #[allow(unused_mut)]
-        let mut jail =
-            create_sandbox_minijail(&jail_config.pivot_root, MAX_OPEN_FILES_DEFAULT, &config)?;
-        #[cfg(feature = "audio_cras")]
-        if backend == Backend::Sys(virtio::snd::sys::StreamSourceBackend::CRAS) {
-            let run_cras_path = Path::new("/run/cras");
-            jail.mount_bind(run_cras_path, run_cras_path, true)?;
-        }
-        Some(jail)
-    } else {
-        None
-    };
-
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail,
     })
 }
 
@@ -720,13 +612,6 @@ pub fn create_pvclock_device(
 impl VirtioDeviceBuilder for &NetParameters {
     const NAME: &'static str = "net";
 
-    fn create_virtio_device(
-        self,
-        protection_type: ProtectionType,
-    ) -> anyhow::Result<Box<dyn VirtioDevice>> {
-        self.create_net_device(protection_type)
-    }
-
     fn create_jail(
         &self,
         jail_config: Option<&JailConfig>,
@@ -949,18 +834,6 @@ pub fn create_virtio_media_adapter(
 
 impl VirtioDeviceBuilder for &VsockConfig {
     const NAME: &'static str = "vhost_vsock";
-
-    fn create_virtio_device(
-        self,
-        protection_type: ProtectionType,
-    ) -> anyhow::Result<Box<dyn VirtioDevice>> {
-        let features = virtio::base_features(protection_type);
-
-        let dev = device_virtio_vsock::vhost::Vsock::new(features, self)
-            .context("failed to set up virtual socket device")?;
-
-        Ok(Box::new(dev))
-    }
 
     fn create_vhost_user_device(
         self,
@@ -1330,43 +1203,16 @@ pub fn create_iommu_device(
     })
 }
 
-fn add_bind_mounts(param: &SerialParameters, jail: &mut Minijail) -> Result<(), minijail::Error> {
-    if let Some(path) = &param.path {
-        if let SerialType::SystemSerialType = param.type_ {
-            if let Some(parent) = path.as_path().parent() {
-                if parent.exists() {
-                    info!("Bind mounting dir {}", parent.display());
-                    jail.mount_bind(parent, parent, true)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// For creating console virtio devices.
 impl VirtioDeviceBuilder for &SerialParameters {
     const NAME: &'static str = "serial";
-
-    fn create_virtio_device(
-        self,
-        protection_type: ProtectionType,
-    ) -> anyhow::Result<Box<dyn VirtioDevice>> {
-        let mut keep_rds = Vec::new();
-        let evt = Event::new().context("failed to create event")?;
-
-        Ok(Box::new(
-            self.create_serial_device::<Console>(protection_type, &evt, &mut keep_rds)
-                .context("failed to create console device")?,
-        ))
-    }
 
     fn create_vhost_user_device(
         self,
         keep_rds: &mut Vec<RawDescriptor>,
     ) -> anyhow::Result<Box<dyn VhostUserDeviceBuilder>> {
         Ok(Box::new(
-            virtio::vhost_user_backend::create_vu_console_device(self, keep_rds)?,
+            device_virtio_console::vhost_user::create_vu_console_device(self, keep_rds)?,
         ))
     }
 
@@ -1376,14 +1222,11 @@ impl VirtioDeviceBuilder for &SerialParameters {
         virtio_transport: VirtioDeviceType,
     ) -> anyhow::Result<Option<Minijail>> {
         if let Some(jail_config) = jail_config {
-            let policy = virtio_transport.seccomp_policy_file("serial");
-            let mut config = SandboxConfig::new(jail_config, &policy);
-            config.bind_mounts = true;
-            let mut jail =
-                create_sandbox_minijail(&jail_config.pivot_root, MAX_OPEN_FILES_DEFAULT, &config)?;
-            add_bind_mounts(self, &mut jail)
-                .context("failed to add bind mounts for console device")?;
-            Ok(Some(jail))
+            device_virtio_console::create_jail(
+                self,
+                jail_config,
+                virtio_transport.seccomp_policy_file("serial").as_str(),
+            )
         } else {
             Ok(None)
         }
@@ -1396,7 +1239,7 @@ pub fn create_sound_device(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,
 ) -> DeviceResult {
-    let dev = virtio::new_sound(path, virtio::base_features(protection_type))
+    let dev = device_virtio_snd::new_sound(path, virtio::base_features(protection_type))
         .context("failed to create sound device")?;
 
     Ok(VirtioDeviceStub {

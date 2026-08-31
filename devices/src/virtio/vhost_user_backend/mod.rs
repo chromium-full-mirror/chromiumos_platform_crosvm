@@ -2,17 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-mod block;
 pub mod connection;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod handler;
 pub mod params;
-#[cfg(feature = "audio")]
-pub mod snd;
-
-pub use block::run_block_device;
-pub use block::Options as BlockOptions;
 pub use connection::sys::VhostUserListener;
 pub use connection::sys::VhostUserStream;
 pub use connection::VhostUserConnectionTrait;
@@ -22,16 +16,11 @@ pub use gpu::run_gpu_device;
 #[cfg(feature = "gpu")]
 pub use gpu::Options as GpuOptions;
 pub use handler::VhostUserDevice;
-#[cfg(feature = "audio")]
-pub use snd::run_snd_device;
-#[cfg(feature = "audio")]
-pub use snd::Options as SndOptions;
 
 pub use crate::virtio::vhost_user_backend::connection::BackendConnection;
 
 cfg_if::cfg_if! {
     if #[cfg(any(target_os = "android", target_os = "linux"))] {
-        mod console;
         mod fs;
         mod vsock;
         #[cfg(feature = "virtio_wl")]
@@ -40,7 +29,6 @@ cfg_if::cfg_if! {
         pub use vsock::{run_vsock_device, Options as VsockOptions, VhostUserVsockDevice};
         #[cfg(feature = "virtio_wl")]
         pub use wl::{run_wl_device, Options as WlOptions};
-        pub use console::{create_vu_console_device, run_console_device, Options as ConsoleOptions};
         pub use fs::{run_fs_device, Options as FsOptions};
     } else if #[cfg(windows)] {
     }

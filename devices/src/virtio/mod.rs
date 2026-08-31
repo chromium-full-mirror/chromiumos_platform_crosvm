@@ -4,7 +4,7 @@
 
 //! Implements virtio devices, queues, and transport mechanisms.
 
-mod async_utils;
+pub mod async_utils;
 #[cfg(feature = "balloon")]
 mod balloon;
 mod descriptor_chain;
@@ -23,16 +23,11 @@ mod virtio_mmio_device;
 mod virtio_pci_common_config;
 mod virtio_pci_device;
 
-pub mod block;
-pub mod console;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(all(unix, feature = "media"))]
 pub mod media;
 pub mod resource_bridge;
-pub mod scsi;
-#[cfg(feature = "audio")]
-pub mod snd;
 pub mod vhost;
 pub mod vhost_user_backend;
 pub mod vhost_user_frontend;
@@ -43,8 +38,6 @@ pub use vmm_vhost::SharedMemoryRegion;
 pub use self::balloon::Balloon;
 #[cfg(feature = "balloon")]
 pub use self::balloon::BalloonFeatures;
-pub use self::block::BlockAsync;
-pub use self::console::Console;
 pub use self::descriptor_chain::DescriptorChain;
 pub use self::descriptor_chain::DescriptorChainIter;
 pub use self::descriptor_utils::create_descriptor_chain;
@@ -78,8 +71,6 @@ pub use self::queue::split_descriptor_chain::SplitDescriptorChain;
 pub use self::queue::PeekedDescriptorChain;
 pub use self::queue::Queue;
 pub use self::queue::QueueConfig;
-pub use self::scsi::DiskConfig as ScsiDiskConfig;
-pub use self::scsi::VirtioScsiModule;
 pub use self::vhost_user_frontend::VhostUserFrontend;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 pub use self::video::VideoDevice;
@@ -108,8 +99,6 @@ cfg_if::cfg_if! {
         pub use self::pmem::Pmem;
         pub use self::pmem::PmemConfig;
         pub use self::pmem::MemSlotConfig;
-        #[cfg(feature = "audio")]
-        pub use self::snd::new_sound;
         #[cfg(feature = "virtio_wl")]
         pub use self::wl::Wl;
     } else if #[cfg(windows)] {
@@ -134,7 +123,7 @@ use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 const DEVICE_RESET: u32 = 0x0;
 
 const INTERRUPT_STATUS_USED_RING: u32 = 0x1;
-const INTERRUPT_STATUS_CONFIG_CHANGED: u32 = 0x2;
+pub const INTERRUPT_STATUS_CONFIG_CHANGED: u32 = 0x2;
 
 const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 

@@ -84,6 +84,10 @@ declare_any_virtio_device_module! {
         Vsock(device_virtio_vsock::VirtioVsockModule),
         #[cfg(feature = "net")]
         Net(device_virtio_net::NetParameters),
-        Scsi(devices::virtio::VirtioScsiModule),
+        Scsi(device_virtio_scsi::VirtioScsiModule),
+        Block(device_virtio_block::DiskOption),
+        #[cfg(feature = "audio")]
+        Snd(device_virtio_snd::VirtioSndModule),
+        Console(device_virtio_console::VirtioConsoleModule),
     }
 }

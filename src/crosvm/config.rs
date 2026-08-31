@@ -29,15 +29,14 @@ use arch::VcpuAffinity;
 use base::debug;
 use base::pagesize;
 use cros_async::ExecutorKind;
+#[cfg(all(windows, feature = "audio"))]
+use device_virtio_snd::vhost_user::sys::windows::SndSplitConfig;
 use devices::serial_device::SerialHardware;
 use devices::serial_device::SerialParameters;
-use devices::virtio::block::DiskOption;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoDeviceConfig;
 #[cfg(feature = "gpu")]
 use devices::virtio::gpu::GpuParameters;
-#[cfg(feature = "audio")]
-use devices::virtio::snd::parameters::Parameters as SndParameters;
 #[cfg(all(windows, feature = "gpu"))]
 use devices::virtio::vhost_user_backend::gpu::sys::windows::GpuBackendConfig;
 #[cfg(all(windows, feature = "gpu"))]
@@ -46,8 +45,6 @@ use devices::virtio::vhost_user_backend::gpu::sys::windows::GpuVmmConfig;
 use devices::virtio::vhost_user_backend::gpu::sys::windows::InputEventSplitConfig;
 #[cfg(all(windows, feature = "gpu"))]
 use devices::virtio::vhost_user_backend::gpu::sys::windows::WindowProcedureThreadSplitConfig;
-#[cfg(all(windows, feature = "audio"))]
-use devices::virtio::vhost_user_backend::snd::sys::windows::SndSplitConfig;
 use devices::virtio::DeviceType;
 use devices::FwCfgParameters;
 use devices::PciAddress;
@@ -646,7 +643,9 @@ pub struct Config {
     pub dev_pm: Option<DevicePowerManagerConfig>,
     pub device_tree_overlay: Vec<DtboOption>,
     pub disable_virtio_intx: bool,
-    pub disks: Vec<DiskOption>,
+    // Disks that run as an automatically setup vhost-user backend.
+    #[cfg(windows)]
+    pub disks_auto_vhost_user: Vec<device_virtio_block::DiskOption>,
     pub display_input_height: Option<u32>,
     pub display_input_width: Option<u32>,
     pub display_window_keyboard: bool,
@@ -745,7 +744,9 @@ pub struct Config {
     pub pvm_fw: Option<PathBuf>,
     pub restore_path: Option<PathBuf>,
     pub rt_cpus: CpuSet,
-
+    /// Note: virtio-console devices are present both in the serial_parameters field and in the
+    /// virtio_device_modules field. They are only present in serial_parameters so that they get
+    /// included in the get_serial_cmdline flow.
     #[serde(with = "serde_serial_params")]
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
     #[cfg(windows)]
@@ -812,9 +813,6 @@ pub struct Config {
     #[serde(default)]
     pub virtio_device_modules: Vec<AnyVirtioDeviceModule>,
     pub virtio_input: Vec<InputDeviceOption>,
-    #[cfg(feature = "audio")]
-    #[serde(skip)]
-    pub virtio_snds: Vec<SndParameters>,
     pub wayland_socket_paths: BTreeMap<String, PathBuf>,
     #[cfg(all(windows, feature = "gpu"))]
     pub window_procedure_thread_split_config: Option<WindowProcedureThreadSplitConfig>,
@@ -876,7 +874,8 @@ impl Default for Config {
             delay_rt: false,
             device_tree_overlay: Vec::new(),
             dev_pm: None,
-            disks: Vec::new(),
+            #[cfg(windows)]
+            disks_auto_vhost_user: Vec::new(),
             disable_virtio_intx: false,
             display_input_height: None,
             display_input_width: None,
@@ -1041,8 +1040,6 @@ impl Default for Config {
             virt_cpufreq_v2: false,
             virtio_device_modules: Vec::new(),
             virtio_input: Vec::new(),
-            #[cfg(feature = "audio")]
-            virtio_snds: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             #[cfg(feature = "media")]
             v4l2_proxy: Vec::new(),

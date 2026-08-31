@@ -86,7 +86,6 @@ use device_virtio_net::NetParametersMode;
 #[cfg(feature = "pci-hotplug")]
 use device_virtio_net::NetPciHotplugResourceCarrier;
 use devices::create_devices_worker_thread;
-use devices::serial_device::SerialHardware;
 #[cfg(all(feature = "pvclock", target_arch = "x86_64"))]
 use devices::tsc::get_tsc_sync_mitigations;
 use devices::vfio::VfioContainerManager;
@@ -396,27 +395,6 @@ fn create_virtio_devices(
                 )?,
             ));
         }
-    }
-
-    for (_, param) in cfg
-        .serial_parameters
-        .iter()
-        .filter(|(_k, v)| v.hardware == SerialHardware::VirtioConsole)
-    {
-        let dev =
-            param.create_virtio_device_and_jail(cfg.protection_type, cfg.jail_config.as_ref())?;
-        devs.push(("console", dev));
-    }
-
-    for disk in &cfg.disks {
-        let (disk_host_tube, disk_device_tube) = Tube::pair().context("failed to create tube")?;
-        add_control_tube(AnyControlTube::Disk(disk_host_tube));
-        let disk_config = DiskConfig::new(disk, Some(disk_device_tube));
-        devs.push((
-            "disk",
-            disk_config
-                .create_virtio_device_and_jail(cfg.protection_type, cfg.jail_config.as_ref())?,
-        ));
     }
 
     for (index, pmem_disk) in cfg.pmems.iter().enumerate() {
@@ -747,26 +725,6 @@ fn create_virtio_devices(
         ));
     }
 
-    #[cfg(feature = "audio")]
-    {
-        for (card_index, virtio_snd) in cfg.virtio_snds.iter().enumerate() {
-            let (snd_host_tube, snd_device_tube) =
-                Tube::pair().context("failed to create tube for snd")?;
-            add_control_tube(AnyControlTube::Snd(snd_host_tube));
-            let mut snd_params = virtio_snd.clone();
-            snd_params.card_index = card_index;
-            devs.push((
-                "snd",
-                create_virtio_snd_device(
-                    cfg.protection_type,
-                    cfg.jail_config.as_ref(),
-                    snd_params,
-                    snd_device_tube,
-                )?,
-            ));
-        }
-    }
-
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[cfg(feature = "media")]
     {
@@ -943,7 +901,7 @@ fn create_virtio_devices(
         "window_keyboard",
         "gpu",
         "console",
-        "disk",
+        "block",
         "scsi",
         "pmem",
         "pmem_ext2",

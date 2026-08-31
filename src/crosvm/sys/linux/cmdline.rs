@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use argh::FromArgValue;
 use argh::FromArgs;
 use cros_async::ExecutorKind;
+use device_virtio_block::DiskOption;
 #[cfg(feature = "net")]
 use device_virtio_net::NetParameters;
 use device_virtio_vsock::VsockConfig;
-use devices::virtio::block::DiskOption;
 use devices::virtio::vhost_user_backend;
 use devices::virtio::vhost_user_backend::params::VhostUserParams;
 use devices::SerialParameters;
@@ -22,7 +22,7 @@ use crate::crosvm::config::validate_serial_parameters;
 #[argh(subcommand)]
 /// Unix Devices
 pub enum DeviceSubcommand {
-    Console(vhost_user_backend::ConsoleOptions),
+    Console(device_virtio_console::vhost_user::Options),
     Fs(vhost_user_backend::FsOptions),
     Vsock(vhost_user_backend::VsockOptions),
     #[cfg(feature = "virtio_wl")]

@@ -41,17 +41,18 @@ use arch::VcpuAffinity;
 use argh::FromArgs;
 use base::getpid;
 use cros_async::ExecutorKind;
+use device_virtio_block::DiskOption;
 #[cfg(all(unix, feature = "net"))]
 use device_virtio_net::NetParameters;
 #[cfg(all(unix, feature = "net"))]
 use device_virtio_net::NetParametersMode;
+use device_virtio_scsi::ScsiOption;
+#[cfg(feature = "audio")]
+use device_virtio_snd::parameters::Parameters as SndParameters;
 use device_virtio_vsock::VsockConfig;
-use devices::virtio::block::DiskOption;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoDeviceConfig;
-use devices::virtio::scsi::ScsiOption;
-#[cfg(feature = "audio")]
-use devices::virtio::snd::parameters::Parameters as SndParameters;
+#[cfg(feature = "gpu")]
 use devices::virtio::vhost_user_backend;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuDisplayParameters;
@@ -575,13 +576,13 @@ pub struct DeviceCommand {
 #[argh(subcommand)]
 /// Cross-platform Devices
 pub enum CrossPlatformDevicesCommands {
-    Block(vhost_user_backend::BlockOptions),
+    Block(device_virtio_block::BlockOptions),
     #[cfg(feature = "gpu")]
     Gpu(vhost_user_backend::GpuOptions),
     #[cfg(feature = "net")]
     Net(device_virtio_net::NetOptions),
     #[cfg(feature = "audio")]
-    Snd(vhost_user_backend::SndOptions),
+    Snd(device_virtio_snd::SndOptions),
 }
 
 #[derive(argh_helpers::FlattenSubcommand)]
@@ -2521,6 +2522,12 @@ impl TryFrom<RunCommand> for super::config::Config {
 
             cfg.serial_parameters.insert(key, serial_params);
         }
+        cfg.virtio_device_modules.extend(
+            cfg.serial_parameters
+                .iter()
+                .filter(|((k, _), _)| *k == SerialHardware::VirtioConsole)
+                .map(|(_, v)| device_virtio_console::VirtioConsoleModule(v.clone()).into()),
+        );
 
         if !(cmd.root.is_none()
             && cmd.rwroot.is_none()
@@ -2559,7 +2566,13 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         // Sort all our disks by index.
         disks.sort_by_key(|d| d.index);
-        cfg.disks = disks.into_iter().map(|d| d.disk_option).collect();
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                cfg.disks_auto_vhost_user = disks.iter().map(|d| d.disk_option.clone()).collect();
+            } else {
+                cfg.virtio_device_modules.extend(disks.iter().map(|d| d.disk_option.clone().into()));
+            }
+        }
 
         cfg.pmems = cmd.pmem;
 
@@ -2586,12 +2599,11 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         // Find the device to use as the kernel `root=` parameter. There can only be one.
-        let virtio_blk_root_devs = cfg
-            .disks
+        let virtio_blk_root_devs = disks
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.root)
-            .map(|(i, d)| (format_disk_letter("/dev/vd", i), d.read_only));
+            .filter(|(_, d)| d.disk_option.root)
+            .map(|(i, d)| (format_disk_letter("/dev/vd", i), d.disk_option.read_only));
 
         let virtio_scsi_root_devs = cmd
             .scsi_block
@@ -2626,7 +2638,7 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         if !cmd.scsi_block.is_empty() {
             cfg.virtio_device_modules
-                .push(devices::virtio::VirtioScsiModule::new(cmd.scsi_block).into());
+                .push(device_virtio_scsi::VirtioScsiModule::new(cmd.scsi_block).into());
         }
 
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -2911,7 +2923,11 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(feature = "audio")]
         {
-            cfg.virtio_snds = cmd.virtio_snd;
+            for (i, mut snd) in cmd.virtio_snd.into_iter().enumerate() {
+                snd.card_index = i;
+                cfg.virtio_device_modules
+                    .push(device_virtio_snd::VirtioSndModule::new(snd).into());
+            }
         }
 
         #[cfg(feature = "gpu")]

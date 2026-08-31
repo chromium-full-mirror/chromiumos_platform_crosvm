@@ -71,14 +71,15 @@ use crosvm_cli::sys::windows::exit::Exit;
 use crosvm_cli::sys::windows::exit::ExitContext;
 use crosvm_cli::sys::windows::exit::ExitContextAnyhow;
 use crosvm_cli::sys::windows::exit::ExitContextOption;
+#[cfg(feature = "audio")]
+use device_virtio_snd::vhost_user::sys::windows::run_snd_device_worker;
+#[cfg(feature = "audio")]
+use device_virtio_snd::vhost_user::sys::windows::SndSplitConfig;
 use devices::create_devices_worker_thread;
-use devices::serial_device::SerialHardware;
-use devices::serial_device::SerialParameters;
 use devices::tsc::get_tsc_sync_mitigations;
 use devices::tsc::standard_deviation;
 use devices::tsc::TscSyncMitigations;
 use devices::virtio;
-use devices::virtio::block::DiskOption;
 #[cfg(feature = "gpu")]
 use devices::virtio::vhost_user_backend::gpu::sys::windows::run_gpu_device_worker;
 #[cfg(feature = "gpu")]
@@ -87,13 +88,8 @@ use devices::virtio::vhost_user_backend::gpu::sys::windows::GpuVmmConfig;
 use devices::virtio::vhost_user_backend::gpu::sys::windows::InputEventSplitConfig;
 #[cfg(feature = "gpu")]
 use devices::virtio::vhost_user_backend::gpu::sys::windows::InputEventVmmConfig;
-#[cfg(feature = "audio")]
-use devices::virtio::vhost_user_backend::snd::sys::windows::run_snd_device_worker;
-#[cfg(feature = "audio")]
-use devices::virtio::vhost_user_backend::snd::sys::windows::SndSplitConfig;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonFeatures;
-use devices::virtio::Console;
 use devices::BusDeviceObj;
 use devices::BusResumeDevice;
 #[cfg(feature = "gvm")]
@@ -274,24 +270,6 @@ fn create_vhost_user_block_device(
     })
 }
 
-fn create_block_device(cfg: &Config, disk: &DiskOption, disk_device_tube: Tube) -> DeviceResult {
-    let features = virtio::base_features(cfg.protection_type);
-    let dev = virtio::BlockAsync::new(
-        features,
-        disk.open()?,
-        disk,
-        Some(disk_device_tube),
-        None,
-        None,
-    )
-    .exit_context(Exit::BlockDeviceNew, "failed to create block device")?;
-
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: None,
-    })
-}
-
 #[cfg(feature = "gpu")]
 fn create_vhost_user_gpu_device(
     base_features: u64,
@@ -407,19 +385,6 @@ fn create_vhost_user_net_device(
     })
 }
 
-fn create_console_device(cfg: &Config, param: &SerialParameters) -> DeviceResult {
-    let mut keep_rds = Vec::new();
-    let evt = Event::new().exit_context(Exit::CreateEvent, "failed to create event")?;
-    let dev = param
-        .create_serial_device::<Console>(cfg.protection_type, &evt, &mut keep_rds)
-        .exit_context(Exit::CreateConsole, "failed to create console device")?;
-
-    Ok(VirtioDeviceStub {
-        dev: Box::new(dev),
-        jail: None,
-    })
-}
-
 #[cfg(feature = "balloon")]
 fn create_balloon_device(
     cfg: &Config,
@@ -462,34 +427,20 @@ fn create_virtio_devices(
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
-    if cfg.block_vhost_user_tube.is_empty() {
-        // Disk devices must precede virtio-console devices or the kernel does not boot.
-        // TODO(b/171215421): figure out why this ordering is required and fix it.
-        for disk in &cfg.disks {
-            let (disk_host_tube, disk_device_tube) =
-                Tube::pair().exit_context(Exit::CreateTube, "failed to create tube")?;
-            add_control_tube(AnyControlTube::Disk(disk_host_tube));
-            devs.push(("block", create_block_device(cfg, disk, disk_device_tube)?));
-        }
-    } else {
-        info!("Starting up vhost user block backends...");
-        for _disk in &cfg.disks {
-            let disk_device_tube = cfg.block_vhost_user_tube.remove(0);
-            let connection = Connection::from(disk_device_tube);
-            devs.push((
-                "block",
-                create_vhost_user_block_device(cfg, connection, vm_evt_wrtube.try_clone()?)?,
-            ));
-        }
-    }
-
-    for (_, param) in cfg
-        .serial_parameters
-        .iter()
-        .filter(|(_k, v)| v.hardware == SerialHardware::VirtioConsole)
-    {
-        let dev = create_console_device(cfg, param)?;
-        devs.push(("console", dev));
+    // Disk devices must precede virtio-console devices or the kernel does not boot.
+    // TODO(b/171215421): figure out why this ordering is required and fix it.
+    info!("Starting up vhost user block backends...");
+    assert_eq!(
+        cfg.block_vhost_user_tube.len(),
+        cfg.disks_auto_vhost_user.len()
+    );
+    for _disk in &cfg.disks_auto_vhost_user {
+        let disk_device_tube = cfg.block_vhost_user_tube.remove(0);
+        let connection = Connection::from(disk_device_tube);
+        devs.push((
+            "block",
+            create_vhost_user_block_device(cfg, connection, vm_evt_wrtube.try_clone()?)?,
+        ));
     }
 
     #[cfg(feature = "audio")]
