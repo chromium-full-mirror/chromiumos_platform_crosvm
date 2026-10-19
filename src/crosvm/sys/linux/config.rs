@@ -8,6 +8,7 @@ use std::str::FromStr;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
+use device_virtio_pmem::PmemExt2Option;
 use devices::IommuDevType;
 use devices::PciAddress;
 use devices::SerialParameters;
@@ -101,7 +102,7 @@ pub struct SharedDir {
     pub ugid: (Option<u32>, Option<u32>),
     pub uid_map: String,
     pub gid_map: String,
-    pub fs_cfg: devices::virtio::fs::Config,
+    pub fs_cfg: device_virtio_fs::Config,
     pub p9_cfg: p9::Config,
 }
 
@@ -275,36 +276,6 @@ impl FromStr for SharedDir {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PmemExt2Option {
-    pub path: PathBuf,
-    pub blocks_per_group: u32,
-    pub inodes_per_group: u32,
-    pub size: u32,
-    pub ugid: (Option<u32>, Option<u32>),
-    pub uid_map: String,
-    pub gid_map: String,
-}
-
-impl Default for PmemExt2Option {
-    fn default() -> Self {
-        let blocks_per_group = 4096;
-        let inodes_per_group = 1024;
-        let size = ext2::BLOCK_SIZE as u32 * blocks_per_group; // only one block group
-        let ugid_cfg = UgidConfig::default();
-        Self {
-            path: Default::default(),
-            blocks_per_group,
-            inodes_per_group,
-            size,
-            ugid: (ugid_cfg.uid, ugid_cfg.gid),
-            uid_map: ugid_cfg.uid_map,
-            gid_map: ugid_cfg.gid_map,
-        }
-    }
-}
-
 pub fn parse_pmem_ext2_option(param: &str) -> Result<PmemExt2Option, String> {
     let mut opt = PmemExt2Option::default();
     let mut components = param.split(':');
@@ -360,7 +331,7 @@ mod tests {
     use std::time::Duration;
 
     use argh::FromArgs;
-    use devices::virtio::fs::CachePolicy;
+    use device_virtio_fs::CachePolicy;
 
     use super::*;
     use crate::crosvm::config::from_key_values;
@@ -735,7 +706,7 @@ mod tests {
         assert_eq!(shared_dir.fs_cfg.writeback, true);
         assert_eq!(
             shared_dir.fs_cfg.cache_policy,
-            devices::virtio::fs::CachePolicy::Always
+            device_virtio_fs::CachePolicy::Always
         );
         assert_eq!(shared_dir.fs_cfg.rewrite_security_xattrs, true);
         assert_eq!(shared_dir.fs_cfg.use_dax, false);
@@ -766,7 +737,7 @@ mod tests {
         assert!(shared_dir.kind == SharedDirKind::FS);
         assert_eq!(
             shared_dir.fs_cfg.cache_policy,
-            devices::virtio::fs::CachePolicy::Always
+            device_virtio_fs::CachePolicy::Always
         );
         assert_eq!(shared_dir.fs_cfg.timeout, Duration::from_secs(3600));
         assert_eq!(shared_dir.fs_cfg.negative_timeout, Duration::from_secs(60));
@@ -786,7 +757,7 @@ mod tests {
         assert_eq!(shared_dir.fs_cfg.writeback, false);
         assert_eq!(
             shared_dir.fs_cfg.cache_policy,
-            devices::virtio::fs::CachePolicy::Always
+            device_virtio_fs::CachePolicy::Always
         );
         assert_eq!(shared_dir.fs_cfg.rewrite_security_xattrs, true);
         assert_eq!(shared_dir.fs_cfg.use_dax, false);
@@ -801,7 +772,7 @@ mod tests {
         let arcvm_arg = "/:_data:type=fs:cache=always:uidmap=0 655360 5000,5000 600 50,5050 660410 1994950:gidmap=0 655360 1065,1065 20119 1,1066 656426 3934,5000 600 50,5050 660410 1994950:timeout=3600:rewrite-security-xattrs=true:writeback=true:privileged_quota_uids=0";
         assert_eq!(
             arcvm_arg.parse::<SharedDir>().unwrap().fs_cfg,
-            devices::virtio::fs::Config {
+            device_virtio_fs::Config {
                 cache_policy: CachePolicy::Always,
                 timeout: Duration::from_secs(3600),
                 rewrite_security_xattrs: true,
@@ -837,7 +808,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             shared_dir.fs_cfg,
-            devices::virtio::fs::Config {
+            device_virtio_fs::Config {
                 cache_policy: CachePolicy::Always,
                 timeout: Duration::from_secs(5),
                 writeback: false,
@@ -854,7 +825,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             shared_dir.fs_cfg,
-            devices::virtio::fs::Config {
+            device_virtio_fs::Config {
                 cache_policy: CachePolicy::Auto,
                 timeout: Duration::from_secs(1),
                 writeback: true,
@@ -962,15 +933,13 @@ mod tests {
 
     #[test]
     fn parse_pmem_ext2() {
-        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+        let run_command = crate::crosvm::cmdline::RunCommand::from_args(
             &[],
             &["--pmem-ext2", "/path/to/dir", "/dev/null"],
         )
-        .unwrap()
-        .try_into()
         .unwrap();
 
-        let opt = config.pmem_ext2.first().unwrap();
+        let opt = run_command.pmem_ext2.first().unwrap();
 
         assert_eq!(opt.path, PathBuf::from("/path/to/dir"));
     }
@@ -981,7 +950,7 @@ mod tests {
         let inodes_per_group = 1024;
         let size = 4096 * blocks_per_group;
 
-        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+        let run_command = crate::crosvm::cmdline::RunCommand::from_args(
             &[],
             &[
                 "--pmem-ext2",
@@ -989,11 +958,9 @@ mod tests {
                 "/dev/null",
             ],
         )
-        .unwrap()
-        .try_into()
         .unwrap();
 
-        let opt = config.pmem_ext2.first().unwrap();
+        let opt = run_command.pmem_ext2.first().unwrap();
 
         assert_eq!(opt.path, PathBuf::from("/path/to/dir"));
         assert_eq!(opt.blocks_per_group, blocks_per_group);

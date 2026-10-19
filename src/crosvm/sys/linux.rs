@@ -7,7 +7,6 @@ mod android;
 pub mod cmdline;
 pub mod config;
 mod device_helpers;
-pub(crate) mod ext2;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu;
 #[cfg(feature = "pci-hotplug")]
@@ -206,8 +205,6 @@ use crate::crosvm::gdb::GdbStub;
 #[cfg(target_arch = "x86_64")]
 use crate::crosvm::ratelimit::Ratelimit;
 use crate::crosvm::sys::cmdline::DevicesCommand;
-use crate::crosvm::sys::config::SharedDir;
-use crate::crosvm::sys::config::SharedDirKind;
 #[cfg(feature = "pci-hotplug")]
 use crate::crosvm::sys::linux::pci_hotplug_helpers::PciHotplugResourceCarrier;
 use crate::crosvm::sys::platform::vcpu::VcpuPidTid;
@@ -395,51 +392,6 @@ fn create_virtio_devices(
                 )?,
             ));
         }
-    }
-
-    for (index, pmem_disk) in cfg.pmems.iter().enumerate() {
-        let (pmem_host_tube, pmem_device_tube) = Tube::pair().context("failed to create tube")?;
-        add_control_tube(AnyControlTube::VmMsync(pmem_host_tube));
-        devs.push((
-            "pmem",
-            create_pmem_device(
-                cfg.protection_type,
-                cfg.jail_config.as_ref(),
-                vm,
-                resources,
-                pmem_disk,
-                index,
-                pmem_device_tube,
-            )?,
-        ));
-    }
-
-    for (index, pmem_ext2) in cfg.pmem_ext2.iter().enumerate() {
-        // Prepare a `VmMemoryClient` for pmem-ext2 device to send a request for mmap() and memory
-        // registeration.
-        let (pmem_ext2_host_tube, pmem_ext2_device_tube) =
-            Tube::pair().context("failed to create tube")?;
-        let vm_memory_client = VmMemoryClient::new(pmem_ext2_device_tube);
-        add_control_tube(AnyControlTube::VmMemoryTube {
-            tube: pmem_ext2_host_tube,
-            expose_with_viommu: false,
-            remote_peer: cfg.jail_config.is_some(),
-        });
-        let (pmem_host_tube, pmem_device_tube) = Tube::pair().context("failed to create tube")?;
-        add_control_tube(AnyControlTube::VmMsync(pmem_host_tube));
-        devs.push((
-            "pmem_ext2",
-            create_pmem_ext2_device(
-                cfg.protection_type,
-                cfg.jail_config.as_ref(),
-                resources,
-                pmem_ext2,
-                index,
-                vm_memory_client,
-                pmem_device_tube,
-                worker_process_pids,
-            )?,
-        ));
     }
 
     #[cfg(feature = "pvclock")]
@@ -798,54 +750,6 @@ fn create_virtio_devices(
         }
     }
 
-    for shared_dir in &cfg.shared_dirs {
-        let SharedDir {
-            src,
-            tag,
-            kind,
-            ugid,
-            uid_map,
-            gid_map,
-            fs_cfg,
-            p9_cfg,
-        } = shared_dir;
-
-        match kind {
-            SharedDirKind::FS => {
-                let (host_tube, device_tube) = Tube::pair().context("failed to create tube")?;
-                add_control_tube(AnyControlTube::Fs(host_tube));
-
-                devs.push((
-                    "fs",
-                    create_fs_device(
-                        cfg.protection_type,
-                        cfg.jail_config.as_ref(),
-                        *ugid,
-                        uid_map,
-                        gid_map,
-                        src,
-                        tag,
-                        fs_cfg.clone(),
-                        device_tube,
-                    )?,
-                ));
-            }
-            SharedDirKind::P9 => devs.push((
-                "9p",
-                create_9p_device(
-                    cfg.protection_type,
-                    cfg.jail_config.as_ref(),
-                    *ugid,
-                    uid_map,
-                    gid_map,
-                    src,
-                    tag,
-                    p9_cfg.clone(),
-                )?,
-            )),
-        };
-    }
-
     #[cfg(feature = "audio")]
     if let Some(path) = &cfg.sound {
         devs.push((
@@ -860,6 +764,8 @@ fn create_virtio_devices(
             resources,
             add_control_tube,
             protection_type: cfg.protection_type,
+            jail_config: cfg.jail_config.as_ref(),
+            worker_process_pids,
         };
         let dev = virtio_device_module
             .create(&mut args)

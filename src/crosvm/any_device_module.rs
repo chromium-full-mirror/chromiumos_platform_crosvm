@@ -89,6 +89,14 @@ declare_any_virtio_device_module! {
         #[cfg(feature = "audio")]
         Snd(device_virtio_snd::VirtioSndModule),
         Console(device_virtio_console::VirtioConsoleModule),
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        Pmem(device_virtio_pmem::VirtioPmemModule),
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        PmemExt2(device_virtio_pmem::VirtioPmemExt2Module),
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        Fs(device_virtio_fs::VirtioFsModule),
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        P9(device_virtio_9p::Virtio9pModule),
         #[cfg(feature = "vendor-devices")]
         Vendor(vendor_devices::VendorDeviceModule),
     }
