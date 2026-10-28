@@ -58,6 +58,8 @@ pub enum Error {
     BackingFileEscapesFirstCluster,
     #[error("backing file io error: {0}")]
     BackingFileIo(io::Error),
+    #[error("backing file not supported")]
+    BackingFileNotSupported,
     #[error("backing file open error: {0}")]
     BackingFileOpen(Box<crate::Error>),
     #[error("backing file name is too long: {0} bytes over")]
@@ -687,6 +689,14 @@ impl QcowFile {
             return Err(Error::FileTooBig(header.size));
         }
 
+        if header.backing_file_path.is_some()
+            || header.backing_file_format.is_some()
+            || header.backing_file_offset != 0
+            || header.backing_file_size != 0
+        {
+            return Err(Error::BackingFileNotSupported);
+        }
+
         let backing_file = if let Some(backing_file_path) = header.backing_file_path.as_ref() {
             let backing_params = DiskFileParams {
                 path: PathBuf::from(backing_file_path),
@@ -841,11 +851,14 @@ impl QcowFile {
     }
 
     /// Creates a new QcowFile at the given path.
+    #[allow(unreachable_code, unused_variables)]
     pub fn new_from_backing(
         file: File,
         params: DiskFileParams,
         backing_file_name: &str,
     ) -> Result<QcowFile> {
+        return Err(Error::BackingFileNotSupported);
+
         // Open the backing file as a `DiskFile` to determine its size (which may not match the
         // filesystem size).
         let (size, backing_format) = {
@@ -906,6 +919,7 @@ impl QcowFile {
         Ok(qcow)
     }
 
+    #[cfg(test)]
     pub fn set_backing_file(&mut self, backing: Option<Box<dyn DiskFile>>) {
         self.inner.get_mut().backing_file = backing;
     }
@@ -2812,6 +2826,7 @@ mod tests {
         });
     }
 
+    #[cfg_attr(not(windows), ignore = "CHROMEOS: qcow2 backing files are disallowed")]
     #[cfg_attr(windows, ignore = "TODO(b/257958782): Enable large test on windows")]
     #[test]
     fn nested_qcow() {
@@ -2955,6 +2970,7 @@ mod tests {
         assert_eq!(read_header.backing_file_format, Some(crate::ImageType::Raw));
     }
 
+    #[ignore = "CHROMEOS: qcow2 backing files are disallowed"]
     #[test]
     fn test_backing_format_respected() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -3074,6 +3090,7 @@ mod tests {
     }
 
     #[cfg(feature = "composite-disk")]
+    #[ignore = "CHROMEOS: qcow2 backing files are disallowed"]
     #[test]
     fn test_composite_backing() {
         use protobuf::Message;
@@ -3157,5 +3174,53 @@ mod tests {
             Err(Error::BackingFileEscapesFirstCluster) => {}
             other => panic!("Expected Error::BackingFileEscapesFirstCluster, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_backing_file_not_supported() {
+        let header = QcowHeader::create_for_size_and_path(
+            0x10_0000,
+            Some(("backing.raw", crate::ImageType::Raw)),
+        )
+        .unwrap();
+
+        let mut file = tempfile().unwrap();
+        header.write_to(&mut file).unwrap();
+
+        // 1. QcowFile::from returns BackingFileNotSupported on backed qcow image
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(matches!(
+            QcowFile::from(file, test_params()).err(),
+            Some(Error::BackingFileNotSupported)
+        ));
+
+        // 2. QcowFile::from returns BackingFileNotSupported when only backing_file_format is set
+        let mut header_fmt_only = QcowHeader::create_for_size_and_path(0x10_0000, None).unwrap();
+        header_fmt_only.backing_file_format = Some(crate::ImageType::Raw);
+        let mut file_fmt_only = tempfile().unwrap();
+        header_fmt_only.write_to(&mut file_fmt_only).unwrap();
+        file_fmt_only.seek(SeekFrom::Start(0)).unwrap();
+        assert!(matches!(
+            QcowFile::from(file_fmt_only, test_params()).err(),
+            Some(Error::BackingFileNotSupported)
+        ));
+
+        // 3. QcowFile::from returns BackingFileNotSupported when non-zero backing_file_size is set
+        let mut header_size_only = QcowHeader::create_for_size_and_path(0x10_0000, None).unwrap();
+        header_size_only.backing_file_size = 10;
+        let mut file_size_only = tempfile().unwrap();
+        header_size_only.write_to(&mut file_size_only).unwrap();
+        file_size_only.seek(SeekFrom::Start(0)).unwrap();
+        assert!(matches!(
+            QcowFile::from(file_size_only, test_params()).err(),
+            Some(Error::BackingFileNotSupported)
+        ));
+
+        // 4. QcowFile::new_from_backing returns BackingFileNotSupported
+        let file_new_backing = tempfile().unwrap();
+        assert!(matches!(
+            QcowFile::new_from_backing(file_new_backing, test_params(), "backing.raw").err(),
+            Some(Error::BackingFileNotSupported)
+        ));
     }
 }
